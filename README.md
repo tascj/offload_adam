@@ -31,9 +31,12 @@ for input_data, target in dataloader:
     loss = loss_function(output, target)
     
     # Backward pass
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+    if gradient_accumulation:
+        loss.backward()
+    else:
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
 ```
 
 ### OffloadAdam
@@ -61,11 +64,15 @@ for input_data, target in dataloader:
     output = model(input_data)
     loss = loss_function(output, target)
     
+
     # Backward pass
-    is_gradient_accumulation_step = ...
-    optimizer.ready_for_optimizer_step = not is_gradient_accumulation_step
-    loss.backward()
-    optimizer.step()
+    if gradient_accumulation:
+        optimizer.ready_for_optimizer_step = False
+        loss.backward()
+    else:
+        optimizer.ready_for_optimizer_step = True
+        loss.backward()
+        optimizer.step()
 ```
 
 ## How it works
