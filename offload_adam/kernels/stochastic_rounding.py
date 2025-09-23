@@ -26,7 +26,7 @@ def _fp32_to_bf16_sr(x_f32, rand_16bit):
     # Adapted from torchao
     x_f32_bits = tl.cast(x_f32, tl.int32, bitcast=True)
     x_fraction = x_f32_bits & 0xFFFF
-    x_bf16_towards_zero = x_f32_bits & 0xFFFF0000
+    x_bf16_towards_zero = x_f32_bits & (-0x10000)
     x_f32_bits = tl.where(
         rand_16bit < x_fraction, x_bf16_towards_zero + 0x10000, x_bf16_towards_zero
     )
@@ -113,4 +113,3 @@ def adam_step_stochastic_rounding(
         decoupled_weight_decay,
         BLOCK_SIZE,
     )
-
