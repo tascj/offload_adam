@@ -2,6 +2,30 @@
 
 Adam optimizer that offloads gradients and optimizer states to CPU memory, enabling full-parameter training of larger models with limited GPU memory.
 
+## Local development
+
+This repository is managed with `uv`.
+
+Create the local development environment:
+
+```bash
+uv sync
+```
+
+Run ad-hoc checks from the project environment:
+
+```bash
+uv run python -c "import offload_adam; print(offload_adam.__version__)"
+uv run pytest
+uv run ruff check .
+```
+
+If you only want to refresh the lockfile after dependency changes:
+
+```bash
+uv lock
+```
+
 
 ## Usage
 
