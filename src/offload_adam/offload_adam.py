@@ -1,24 +1,35 @@
+"""OffloadAdam: Adam with gradients and optimizer states offloaded to host memory.
+
+Two execution paths share the same transfer primitives and are selected by
+whether `gradient_clipping` is passed:
+
+- No clipping → step runs inside each param's post-accumulate-grad hook on
+  the last micro-batch, overlapping load/compute/writeback with backward.
+- Clipping → backward only accumulates grad and per-param norms; the full
+  step loop (global clip, chunked load/compute/writeback) runs in `.step()`.
+"""
+
+import warnings
+
 import torch
 from torch.optim.optimizer import Optimizer
 
-from .pinned_alloc import zeros_pinned
 from .kernels import (
-    adam_step_stochastic_rounding,
-    adam_step_fp32_master,
     adam_step_fp31_master,
+    adam_step_fp32_master,
     adam_step_fp32_master_custom_rounding,
+    adam_step_stochastic_rounding,
 )
+from .pinned_alloc import zeros_pinned
 
 
 def get_leaf_modules_with_params(module):
     """Recursively collect leaf modules with parameters from a PyTorch model."""
     leaf_modules = []
     for child in module.children():
-        if list(child.children()):  # If the module has children, recurse
+        if list(child.children()):
             leaf_modules.extend(get_leaf_modules_with_params(child))
-        elif any(
-            p.requires_grad for p in child.parameters(recurse=False)
-        ):  # Check if it has parameters
+        elif any(p.requires_grad for p in child.parameters(recurse=False)):
             leaf_modules.append(child)
     return leaf_modules
 
@@ -27,23 +38,25 @@ class OffloadAdam(Optimizer):
     """Adam optimizer that offloads gradients and optimizer states to host memory.
 
     Args:
-        model (nn.Module): Model containing parameters to optimize
-        lr (float, optional): Learning rate. Default: 1e-3
-        betas (Tuple[float, float], optional): Coefficients for computing running averages of
-            gradient and its square. Default: (0.9, 0.999)
-        eps (float, optional): Term added to denominator to improve numerical stability. Default: 1e-8
-        weight_decay (float, optional): Weight decay (L2 penalty). Default: 0.01
-        mode (str, optional): Optimization step mode - one of 'stochastic_rounding', 'fp32_master',
-            'fp31_master', or 'fp32_master_custom_rounding'. Default: 'stochastic_rounding'
-        gradient_clipping (dict, optional): Dict with 'max_norm' and 'norm_type' for gradient clipping.
-            Default: None
-        numa_node (str | int | None, optional): NUMA policy for pinned host allocations.
-            'auto' (default) binds each allocation to the current CUDA device's NUMA
-            node when libnuma and the sysfs topology are available; an int specifies
-            a node explicitly; None disables NUMA binding.
-        decoupled_weight_decay (bool, optional): Whether to decouple weight decay. Default: False
-        step_chunk_size (int, optional): Update in chunks smaller than parameter size. Useful for single
-            large parameter (e.g. token embedding). Default: 10M
+        model (nn.Module): Model containing parameters to optimize.
+        lr (float): Learning rate. Default: 1e-3.
+        betas (Tuple[float, float]): Running-average coefficients.
+            Default: (0.9, 0.999).
+        eps (float): Denominator term for numerical stability. Default: 1e-8.
+        weight_decay (float): Weight decay coefficient. Default: 0.01.
+        mode (str): One of `'stochastic_rounding'`, `'fp32_master'`,
+            `'fp31_master'`, `'fp32_master_custom_rounding'`. Default:
+            `'stochastic_rounding'`.
+        gradient_clipping (dict | None): `{'max_norm': float, 'norm_type': float}`
+            for global-norm clipping. `None` disables clipping and routes the
+            step into the backward hook for maximum backward/step overlap.
+        numa_node (str | int | None): NUMA policy for pinned allocations —
+            `'auto'`, an int node id, or `None`.
+        decoupled_weight_decay (bool): Decouple weight decay from gradient
+            (AdamW style). Default: False.
+        step_chunk_size (int | None): Chunk size used by the `.step()` path
+            (only active when `gradient_clipping` is set). Default: 10M.
+        verbose (int): Non-zero prints total pinned bytes allocated.
     """
 
     supported_modes = {
@@ -84,6 +97,8 @@ class OffloadAdam(Optimizer):
         },
     }
 
+    _DEFAULT_STEP_CHUNK_SIZE = 1024 ** 2 * 10
+
     def __init__(
         self,
         model,
@@ -92,228 +107,285 @@ class OffloadAdam(Optimizer):
         eps=1e-8,
         weight_decay=0.01,
         mode="stochastic_rounding",
-        gradient_clipping=None,  # dict(max_norm=1.0, norm_type=2.0)
+        gradient_clipping=None,
         numa_node="auto",
         decoupled_weight_decay=False,
-        step_chunk_size=1024**2 * 10,
+        step_chunk_size=None,
         verbose=0,
     ):
         assert mode in self.supported_modes, (
-            f"Invalid mode: {mode}, available modes: {self.supported_modes.keys()}"
+            f"Invalid mode: {mode}, available modes: {list(self.supported_modes)}"
         )
         self.mode = mode
-        self.step_fn = self.supported_modes[self.mode]["step"]
-
-        modules = get_leaf_modules_with_params(model)
-        params = []
-        for module in modules:
-            for p in module.parameters():
-                if p.requires_grad:
-                    params.append(p)
-
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-        super(OffloadAdam, self).__init__(params, defaults)
+        self.step_fn = self.supported_modes[mode]["step"]
+        self.offload_config = self.supported_modes[mode]["offload"]
+        self.offload_state_keys = list(self.offload_config.keys())
+        self._non_grad_keys = [k for k in self.offload_state_keys if k != "grad"]
 
         self.gradient_clipping = gradient_clipping
+        # Without a clip spec we can fuse load/compute/writeback into backward
+        # hooks. Clipping needs a global norm, which forces the step back into
+        # `.step()` with a chunked loop.
+        self._step_in_backward = gradient_clipping is None
+
+        if step_chunk_size is None:
+            step_chunk_size = self._DEFAULT_STEP_CHUNK_SIZE
+        elif self._step_in_backward:
+            warnings.warn(
+                "step_chunk_size is ignored when gradient_clipping is None; "
+                "the step runs per-parameter inside backward hooks.",
+                stacklevel=2,
+            )
+        self.step_chunk_size = step_chunk_size
+
         self.decoupled_weight_decay = decoupled_weight_decay
         self.verbose = verbose
         self.ready_for_optimizer_step = False
-        self.step_chunk_size = step_chunk_size
+
+        modules = get_leaf_modules_with_params(model)
+        params = [
+            p for m in modules for p in m.parameters() if p.requires_grad
+        ]
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
 
         self.device_states = {}
-        self.d2h_events = {}
         self.h2d_events = {}
-        self.d2h_stream = torch.cuda.Stream()
+        self.d2h_events = {}
         self.h2d_stream = torch.cuda.Stream()
+        self.d2h_stream = torch.cuda.Stream()
 
-        param2group = {}
-        for group in self.param_groups:
-            for param in group["params"]:
-                param2group[param] = group
+        param2group = {
+            p: group for group in self.param_groups for p in group["params"]
+        }
+        self._register_hooks(modules, param2group)
+        self._alloc_pinned_states(params, numa_node)
 
-        # hooks for h2d transfer
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def _register_hooks(self, modules, param2group):
         for module in modules:
-            module.register_full_backward_pre_hook(self.pre_backward_hook)
-            for param in module.parameters():
-                if not param.requires_grad:
+            module.register_full_backward_pre_hook(self._pre_backward_hook)
+            for p in module.parameters():
+                if not p.requires_grad:
                     continue
-
-                group = param2group[param]
-                param.register_post_accumulate_grad_hook(
-                    self._create_post_accumulate_grad_hook(param, group)
+                p.register_post_accumulate_grad_hook(
+                    self._make_grad_hook(p, param2group[p])
                 )
-                self.device_states[param] = {}
-                state = self.state[param]
+                self.device_states[p] = {}
+                state = self.state[p]
                 state["step"] = 0
                 state["host_grad_valid"] = False
                 if self.gradient_clipping is not None:
                     state["grad_norm"] = torch.tensor(0.0, device="cuda")
 
-        offload_config = self.supported_modes[self.mode]["offload"]
-        self.offload_config = offload_config
-        self.offload_state_keys = list(offload_config.keys())
-
+    def _alloc_pinned_states(self, params, numa_node):
         total_bytes = 0
-        for param in params:
-            state = self.state[param]
-            for name, dtype in offload_config.items():
-                t = zeros_pinned(param.shape, dtype, numa_node=numa_node)
+        for p in params:
+            state = self.state[p]
+            for name, dtype in self.offload_config.items():
+                t = zeros_pinned(p.shape, dtype, numa_node=numa_node)
                 if name == "master_params":
-                    t.copy_(param.data)
+                    t.copy_(p.data)
                 state[name] = t
                 total_bytes += t.numel() * t.element_size()
-
         if self.verbose > 0:
             print(
-                f"Pinned host memory allocated: {total_bytes / (1024**3):.2f} GB"
+                f"Pinned host memory allocated: {total_bytes / (1024 ** 3):.2f} GB"
             )
 
-    def _host_view(self, param, name, param_chunk=None):
-        t = self.state[param][name]
-        if param_chunk is not None:
-            t = t.view(-1)[param_chunk]
+    # ------------------------------------------------------------------
+    # Layer 1 — transfer primitives
+    # ------------------------------------------------------------------
+
+    def _host_view(self, p, name, chunk=None):
+        t = self.state[p][name]
+        if chunk is not None:
+            t = t.view(-1)[chunk]
         return t
 
-    def ensure_on_device(
-        self, device_states, param, offload_state_keys, param_chunk=None
-    ):
-        """Ensure the given states are on the device.
-        In case prefetch is not set, copy the states from host to device here."""
-        if param in self.h2d_events:
-            self.h2d_events[param].synchronize()
-        for offload_state_key in offload_state_keys:
-            if device_states.get(offload_state_key, None) is None:
-                device_states[offload_state_key] = self._host_view(
-                    param, offload_state_key, param_chunk
-                ).to(param.device, non_blocking=True)
-
-    def issue_h2d_transfer(self, param, offload_state_keys, param_chunk=None):
-        """Issue host to device transfers for the given states"""
+    def _issue_h2d(self, p, keys, chunk=None):
         main_stream = torch.cuda.current_stream()
-        device_states = self.device_states[param]
-        if param in self.d2h_events:
-            self.d2h_events[param].synchronize()
+        device_states = self.device_states[p]
+        if p in self.d2h_events:
+            self.d2h_events[p].synchronize()
         self.h2d_stream.wait_stream(main_stream)
-        for offload_state_key in offload_state_keys:
+        for key in keys:
             with torch.cuda.stream(self.h2d_stream):
-                device_states[offload_state_key] = self._host_view(
-                    param, offload_state_key, param_chunk
-                ).to(param.device, non_blocking=True)
-        self.h2d_events[param] = self.h2d_stream.record_event()
-
-    def issue_d2h_transfer(self, param, offload_state_keys, param_chunk=None):
-        """Issue device to host transfers for the given states"""
-        main_stream = torch.cuda.current_stream()
-        device_states = self.device_states[param]
-        if param in self.h2d_events:
-            self.h2d_events[param].synchronize()
-        self.d2h_stream.wait_stream(main_stream)
-        for offload_state_key in offload_state_keys:
-            with torch.cuda.stream(self.d2h_stream):
-                self._host_view(param, offload_state_key, param_chunk).copy_(
-                    device_states[offload_state_key], non_blocking=True
+                device_states[key] = self._host_view(p, key, chunk).to(
+                    p.device, non_blocking=True
                 )
-            # release device memory
-            device_states[offload_state_key].record_stream(self.d2h_stream)
-            device_states[offload_state_key] = None
-        self.d2h_events[param] = self.d2h_stream.record_event()
+        self.h2d_events[p] = self.h2d_stream.record_event()
 
-    def pre_backward_hook(self, module, grad_output):
-        # Prefetch gradients from Host to Device
-        # Overlap with backward computation
-        for param in module.parameters():
-            if self.state[param]["host_grad_valid"]:
-                self.issue_h2d_transfer(param, ["grad"])
+    def _issue_d2h(self, p, keys, chunk=None):
+        main_stream = torch.cuda.current_stream()
+        device_states = self.device_states[p]
+        if p in self.h2d_events:
+            self.h2d_events[p].synchronize()
+        self.d2h_stream.wait_stream(main_stream)
+        for key in keys:
+            with torch.cuda.stream(self.d2h_stream):
+                self._host_view(p, key, chunk).copy_(
+                    device_states[key], non_blocking=True
+                )
+            device_states[key].record_stream(self.d2h_stream)
+            device_states[key] = None
+        self.d2h_events[p] = self.d2h_stream.record_event()
 
-    def _create_post_accumulate_grad_hook(self, param, group):
+    def _ensure_on_device(self, p, keys, chunk=None):
+        """Block main stream on the pending h2d event; synchronously fetch any
+        key that wasn't prefetched."""
+        device_states = self.device_states[p]
+        if p in self.h2d_events:
+            self.h2d_events[p].synchronize()
+        for key in keys:
+            if device_states.get(key, None) is None:
+                device_states[key] = self._host_view(p, key, chunk).to(
+                    p.device, non_blocking=True
+                )
+
+    # ------------------------------------------------------------------
+    # Layer 2 — compound per-param ops
+    # ------------------------------------------------------------------
+
+    def _accumulate_grad_on_device(self, p):
+        """Fold p.grad into the device-resident grad buffer.
+
+        First micro-batch of a window adopts p.grad as the device grad; later
+        micro-batches wait for the prefetched host grad and add p.grad into it.
+        """
+        device_states = self.device_states[p]
+        state = self.state[p]
+        if state["host_grad_valid"]:
+            self._ensure_on_device(p, ["grad"])
+            device_states["grad"].add_(p.grad)
+        else:
+            device_states["grad"] = p.grad
+            state["host_grad_valid"] = True
+        p.grad = None
+
+    def _call_step_fn(self, p, group, chunk=None):
+        state = self.state[p]
+        param_view = p.data if chunk is None else p.data.view(-1)[chunk]
+        beta1, beta2 = group["betas"]
+        self.step_fn(
+            param_view,
+            self.device_states[p],
+            group["lr"],
+            group["weight_decay"],
+            beta1,
+            beta2,
+            group["eps"],
+            state["step"],
+            decoupled_weight_decay=self.decoupled_weight_decay,
+        )
+
+    def _step_overlapped(self, p, group):
+        """Run the step for `p` from inside its grad hook.
+
+        Non-grad states were prefetched in `_pre_backward_hook`; grad is
+        already on device from `_accumulate_grad_on_device`.
+        """
+        self._ensure_on_device(p, self._non_grad_keys)
+        self._call_step_fn(p, group)
+        self._issue_d2h(p, self._non_grad_keys)
+        self.device_states[p]["grad"] = None
+
+    def _step_chunked(self, p, group, clip_coef=None):
+        """Run the step for `p` in fixed-size chunks from `.step()`.
+
+        Each chunk pulls grad + non-grad states from host, optionally applies
+        the global clip coefficient, runs the step, and writes non-grad states
+        back. Chunking keeps peak device memory bounded for huge params.
+        """
+        size = p.numel()
+        device_states = self.device_states[p]
+        for start in range(0, size, self.step_chunk_size):
+            end = min(start + self.step_chunk_size, size)
+            chunk = slice(start, end)
+            self._issue_h2d(p, self.offload_state_keys, chunk)
+            self._ensure_on_device(p, self.offload_state_keys, chunk)
+            if clip_coef is not None:
+                device_states["grad"].mul_(clip_coef)
+            self._call_step_fn(p, group, chunk)
+            self._issue_d2h(p, self._non_grad_keys, chunk)
+            device_states["grad"] = None
+
+    # ------------------------------------------------------------------
+    # Layer 3 — hooks (the two strategies diverge here)
+    # ------------------------------------------------------------------
+
+    def _pre_backward_hook(self, module, grad_output):
+        for p in module.parameters():
+            keys = []
+            if self.state[p]["host_grad_valid"]:
+                keys.append("grad")
+            if self._step_in_backward and self.ready_for_optimizer_step:
+                keys.extend(self._non_grad_keys)
+            if keys:
+                self._issue_h2d(p, keys)
+
+    def _make_grad_hook(self, p, group):
         @torch.no_grad()
-        def grad_accumulate_hook(*_unused):
-            if param.grad is None:
+        def hook(*_unused):
+            if p.grad is None:
                 return
 
-            # states prefetched in pre_backward_hook
-            device_states = self.device_states[param]
-            state = self.state[param]
+            self._accumulate_grad_on_device(p)
+            state = self.state[p]
 
-            if state["host_grad_valid"]:
-                # accumulate grad on host
-                self.ensure_on_device(device_states, param, ["grad"])
-                device_states["grad"].add_(param.grad)
-            else:
-                # first accumulate, copy grad to host
-                device_states["grad"] = param.grad
-                state["host_grad_valid"] = True
-            if self.ready_for_optimizer_step and self.gradient_clipping is not None:
-                self.state[param]["grad_norm"] = torch.norm(
-                    device_states["grad"], self.gradient_clipping["norm_type"]
+            # Clipping path: record per-param norm; .step() reduces it into
+            # the global norm and applies the clip coefficient chunk by chunk.
+            if self.gradient_clipping is not None and self.ready_for_optimizer_step:
+                state["grad_norm"] = torch.norm(
+                    self.device_states[p]["grad"],
+                    self.gradient_clipping["norm_type"],
                 )
-            param.grad = None
-            self.issue_d2h_transfer(param, ["grad"])
-            return
 
-        return grad_accumulate_hook
+            # Step-in-backward path: run the whole step here on the last mb;
+            # every other case just writes the accumulated grad back to host.
+            if self._step_in_backward and self.ready_for_optimizer_step:
+                state["step"] += 1
+                self._step_overlapped(p, group)
+                state["host_grad_valid"] = False
+            else:
+                self._issue_d2h(p, ["grad"])
+
+        return hook
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def step(self, closure=None):
-        # clip_grad_norm_
+        if self._step_in_backward:
+            return
+
+        clip_coef = None
         if self.gradient_clipping is not None:
-            norms = []
-            for group in self.param_groups:
-                for p in group["params"]:
-                    norms.append(self.state[p]["grad_norm"])
+            norms = [
+                self.state[p]["grad_norm"]
+                for group in self.param_groups
+                for p in group["params"]
+            ]
             total_norm = torch.linalg.vector_norm(
                 torch.stack(norms), self.gradient_clipping["norm_type"]
             )
-            clip_coef = self.gradient_clipping["max_norm"] / (total_norm + 1e-6)
-            clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+            clip_coef = torch.clamp(
+                self.gradient_clipping["max_norm"] / (total_norm + 1e-6),
+                max=1.0,
+            )
 
         for group in self.param_groups:
             for p in group["params"]:
                 state = self.state[p]
                 state["step"] += 1
-
-                lr = group["lr"]
-                beta1, beta2 = group["betas"]
-                eps = group["eps"]
-                weight_decay = group["weight_decay"]
-                step = state["step"]
-
-                device_states = self.device_states[p]
-
-                param_size = p.numel()
-                for start in range(0, param_size, self.step_chunk_size):
-                    end = min(start + self.step_chunk_size, param_size)
-                    param_chunk = slice(start, end)
-                    self.issue_h2d_transfer(p, self.offload_state_keys, param_chunk)
-                    self.ensure_on_device(
-                        device_states, p, self.offload_state_keys, param_chunk
-                    )
-                    if self.gradient_clipping is not None:
-                        device_states["grad"].mul_(clip_coef_clamped)
-
-                    self.step_fn(
-                        p.data.view(-1)[param_chunk],
-                        device_states,
-                        lr,
-                        weight_decay,
-                        beta1,
-                        beta2,
-                        eps,
-                        step,
-                        decoupled_weight_decay=self.decoupled_weight_decay,
-                    )
-
-                    self.issue_d2h_transfer(
-                        p,
-                        [name for name in self.offload_state_keys if name != "grad"],
-                        param_chunk,
-                    )
-                    device_states["grad"] = None
-                    # mark grad on host as invalid
+                self._step_chunked(p, group, clip_coef=clip_coef)
                 state["host_grad_valid"] = False
 
-        return
-
     def zero_grad(self, set_to_none=False):
-        """No-op."""
+        """No-op; grads are managed by the hooks."""
         return

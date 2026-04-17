@@ -1,7 +1,7 @@
 # End-to-end training example
 
 A single-file script (`train.py`) that trains a HuggingFace causal LM on
-synthetic data using this library's `Adam` or `OffloadAdamV2`. It reports
+synthetic data using this library's `Adam` or `OffloadAdam`. It reports
 per-step timing and a JSON summary that is easy to aggregate.
 
 ## Usage
@@ -14,7 +14,7 @@ uv sync --group examples
 ```
 
 ```bash
-# OffloadAdamV2 (default)
+# OffloadAdam (default)
 uv run python examples/e2e_train/train.py \
     --tokens-per-sample 4096 --grad-accum-steps 4 --steps 10 --warmup-steps 2
 

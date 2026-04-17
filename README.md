@@ -101,16 +101,22 @@ for input_data, target in dataloader:
 
 ## How it works
 
-1. Module `register_full_backward_pre_hook`:
-    * asynchronously copy states from CPU to GPU
+`OffloadAdam` has two execution paths selected by whether
+`gradient_clipping` is supplied:
 
-2. Parameter `register_post_accumulate_grad_hook`:
-    * gradient accumulation
-    * norm calculation for gradient clipping (in OffloadAdam)
-    * optimizer step (in OffloadAdamV2)
-    * asynchronously copy states back to CPU
+* `gradient_clipping=None` (default): the whole optimizer step for each
+  parameter runs inside that parameter's post-accumulate-grad hook on the
+  last micro-batch. Optimizer-state loads, compute, and writebacks overlap
+  with the remaining backward work, and `optimizer.step()` is a no-op.
+* `gradient_clipping=dict(max_norm=..., norm_type=...)`: backward only
+  accumulates gradients and records per-parameter norms. `optimizer.step()`
+  then reduces the global norm, applies the clip coefficient, and walks each
+  parameter in fixed-size chunks (`step_chunk_size`) of
+  load → compute → writeback. Chunking keeps peak GPU memory bounded for
+  very large parameters (e.g. embedding tables).
 
-Optimizer step is done on GPU.
+Both paths share the same host↔device transfer primitives. The optimizer
+step always runs on GPU.
 
 With offloading, it's possible do full-parameter training of:
 * 7B models using single 24GB GPU and 42GB+ host memory
