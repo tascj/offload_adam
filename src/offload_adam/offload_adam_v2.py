@@ -13,7 +13,7 @@ class OffloadAdamV2(OffloadAdam):
         eps=1e-8,
         weight_decay=0.01,
         mode="stochastic_rounding",
-        bucket_size=4 * (1024**3),
+        numa_node="auto",
         decoupled_weight_decay=False,
         verbose=0,
     ):
@@ -24,7 +24,7 @@ class OffloadAdamV2(OffloadAdam):
             eps=eps,
             weight_decay=weight_decay,
             mode=mode,
-            bucket_size=bucket_size,
+            numa_node=numa_node,
             decoupled_weight_decay=decoupled_weight_decay,
             verbose=verbose,
         )

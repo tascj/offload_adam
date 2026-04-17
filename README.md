@@ -184,3 +184,4 @@ There are optimization chances but not implemented yet.
 
 - [torchao](https://github.com/pytorch/ao)
 - [optimi](https://github.com/warner-benjamin/optimi)
+- [LMCache](https://github.com/LMCache/LMCache) — CPU pinned-memory design (mmap + mbind + cudaHostRegister) referenced when building `pinned_alloc.py`.

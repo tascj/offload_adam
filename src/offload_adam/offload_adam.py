@@ -1,7 +1,7 @@
 import torch
 from torch.optim.optimizer import Optimizer
 
-from .pin_memory import PinnedMemoryManager
+from .pinned_alloc import zeros_pinned
 from .kernels import (
     adam_step_stochastic_rounding,
     adam_step_fp32_master,
@@ -37,7 +37,10 @@ class OffloadAdam(Optimizer):
             'fp31_master', or 'fp32_master_custom_rounding'. Default: 'stochastic_rounding'
         gradient_clipping (dict, optional): Dict with 'max_norm' and 'norm_type' for gradient clipping.
             Default: None
-        bucket_size (int, optional): Size of memory buckets in bytes. Default: 4GB
+        numa_node (str | int | None, optional): NUMA policy for pinned host allocations.
+            'auto' (default) binds each allocation to the current CUDA device's NUMA
+            node when libnuma and the sysfs topology are available; an int specifies
+            a node explicitly; None disables NUMA binding.
         decoupled_weight_decay (bool, optional): Whether to decouple weight decay. Default: False
         step_chunk_size (int, optional): Update in chunks smaller than parameter size. Useful for single
             large parameter (e.g. token embedding). Default: 10M
@@ -90,7 +93,7 @@ class OffloadAdam(Optimizer):
         weight_decay=0.01,
         mode="stochastic_rounding",
         gradient_clipping=None,  # dict(max_norm=1.0, norm_type=2.0)
-        bucket_size=4 * (1024**3),
+        numa_node="auto",
         decoupled_weight_decay=False,
         step_chunk_size=1024**2 * 10,
         verbose=0,
@@ -150,17 +153,26 @@ class OffloadAdam(Optimizer):
         self.offload_config = offload_config
         self.offload_state_keys = list(offload_config.keys())
 
-        self.host_states = PinnedMemoryManager(
-            params, self.offload_config, bucket_size, verbose=self.verbose
-        )
-        if self.mode == "fp32_master":
-            for param in params:
-                self.host_states.get(param, "master_params").copy_(param.data)
+        total_bytes = 0
+        for param in params:
+            state = self.state[param]
+            for name, dtype in offload_config.items():
+                t = zeros_pinned(param.shape, dtype, numa_node=numa_node)
+                if name == "master_params":
+                    t.copy_(param.data)
+                state[name] = t
+                total_bytes += t.numel() * t.element_size()
+
         if self.verbose > 0:
             print(
-                f"Total memory requested: {self.host_states.total_memory_requested:.2f}GB,"
-                f" Total memory allocated: {self.host_states.total_memory_allocated:.2f}GB"
+                f"Pinned host memory allocated: {total_bytes / (1024**3):.2f} GB"
             )
+
+    def _host_view(self, param, name, param_chunk=None):
+        t = self.state[param][name]
+        if param_chunk is not None:
+            t = t.view(-1)[param_chunk]
+        return t
 
     def ensure_on_device(
         self, device_states, param, offload_state_keys, param_chunk=None
@@ -171,7 +183,7 @@ class OffloadAdam(Optimizer):
             self.h2d_events[param].synchronize()
         for offload_state_key in offload_state_keys:
             if device_states.get(offload_state_key, None) is None:
-                device_states[offload_state_key] = self.host_states.get(
+                device_states[offload_state_key] = self._host_view(
                     param, offload_state_key, param_chunk
                 ).to(param.device, non_blocking=True)
 
@@ -184,7 +196,7 @@ class OffloadAdam(Optimizer):
         self.h2d_stream.wait_stream(main_stream)
         for offload_state_key in offload_state_keys:
             with torch.cuda.stream(self.h2d_stream):
-                device_states[offload_state_key] = self.host_states.get(
+                device_states[offload_state_key] = self._host_view(
                     param, offload_state_key, param_chunk
                 ).to(param.device, non_blocking=True)
         self.h2d_events[param] = self.h2d_stream.record_event()
@@ -198,7 +210,7 @@ class OffloadAdam(Optimizer):
         self.d2h_stream.wait_stream(main_stream)
         for offload_state_key in offload_state_keys:
             with torch.cuda.stream(self.d2h_stream):
-                self.host_states.get(param, offload_state_key, param_chunk).copy_(
+                self._host_view(param, offload_state_key, param_chunk).copy_(
                     device_states[offload_state_key], non_blocking=True
                 )
             # release device memory

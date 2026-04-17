@@ -44,7 +44,11 @@ def parse_args():
     parser.add_argument("--warmup-steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--bucket-size-gb", type=float, default=16.0)
+    parser.add_argument(
+        "--numa-node",
+        default="auto",
+        help="NUMA policy for pinned allocations: 'auto', an int node id, or 'none'.",
+    )
     parser.add_argument(
         "--gradient-checkpointing",
         action=argparse.BooleanOptionalAction,
@@ -115,9 +119,14 @@ def build_optimizer(args, model):
         "decoupled_weight_decay": True,
     }
     if args.enable_offloading:
+        numa_node = args.numa_node
+        if numa_node == "none":
+            numa_node = None
+        elif numa_node != "auto":
+            numa_node = int(numa_node)
         return OffloadAdamV2(
             model,
-            bucket_size=int(args.bucket_size_gb * (1024**3)),
+            numa_node=numa_node,
             verbose=1,
             **common,
         )
