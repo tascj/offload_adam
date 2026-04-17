@@ -6,6 +6,13 @@ per-step timing and a JSON summary that is easy to aggregate.
 
 ## Usage
 
+Install the extra dependencies the script needs (`transformers`,
+`accelerate`, `liger-kernel`):
+
+```bash
+uv sync --group examples
+```
+
 ```bash
 # OffloadAdamV2 (default)
 uv run python examples/e2e_train/train.py \

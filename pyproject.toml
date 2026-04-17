@@ -34,6 +34,11 @@ dev = [
     "pytest>=8.3.5",
     "ruff>=0.11.6",
 ]
+examples = [
+    "accelerate",
+    "liger-kernel",
+    "transformers",
+]
 
 [build-system]
 requires = ["uv_build>=0.10.2,<0.11.0"]
