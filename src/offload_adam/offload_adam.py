@@ -56,6 +56,12 @@ class OffloadAdam(Optimizer):
             (AdamW style). Default: False.
         step_chunk_size (int | None): Chunk size used by the `.step()` path
             (only active when `gradient_clipping` is set). Default: 100M.
+        inplace_param_threshold (int | None): Params with fewer elements than
+            this stay fully on GPU (states + grad), bypassing PCIe entirely.
+            The default covers typical LLM normalization weights and biases
+            while leaving attention/MLP projections and embeddings on the
+            offload path. Set `0` to force every param onto the offload path.
+            Default: 1M elements.
         verbose (int): Non-zero prints total pinned bytes allocated.
     """
 
@@ -98,6 +104,7 @@ class OffloadAdam(Optimizer):
     }
 
     _DEFAULT_STEP_CHUNK_SIZE = 1024 ** 2 * 100
+    _DEFAULT_INPLACE_PARAM_THRESHOLD = 1024 * 1024
     # Max in-flight chunks before the chunked-step loop CPU-waits on the
     # oldest d2h. K=2 gives full 3-stream (h2d/compute/d2h) overlap with
     # peak device memory bounded to ~3× chunk_size.
@@ -115,6 +122,7 @@ class OffloadAdam(Optimizer):
         numa_node="auto",
         decoupled_weight_decay=False,
         step_chunk_size=None,
+        inplace_param_threshold=None,
         verbose=0,
     ):
         assert mode in self.supported_modes, (
@@ -153,6 +161,17 @@ class OffloadAdam(Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
+        # Partition params: small ones stay fully on GPU; big ones get offloaded.
+        if inplace_param_threshold is None:
+            inplace_param_threshold = self._DEFAULT_INPLACE_PARAM_THRESHOLD
+        self.inplace_param_threshold = inplace_param_threshold
+        self._inplace_params = {
+            p for p in params if p.numel() < inplace_param_threshold
+        }
+        self._offload_params = [
+            p for p in params if p not in self._inplace_params
+        ]
+
         self.device_states = {}
         self.h2d_events = {}
         self.d2h_events = {}
@@ -163,7 +182,8 @@ class OffloadAdam(Optimizer):
             p: group for group in self.param_groups for p in group["params"]
         }
         self._register_hooks(modules, param2group)
-        self._alloc_pinned_states(params, numa_node)
+        self._alloc_pinned_states(self._offload_params, numa_node)
+        self._alloc_inplace_states(self._inplace_params)
 
     # ------------------------------------------------------------------
     # Setup
@@ -175,15 +195,20 @@ class OffloadAdam(Optimizer):
             for p in module.parameters():
                 if not p.requires_grad:
                     continue
-                p.register_post_accumulate_grad_hook(
-                    self._make_grad_hook(p, param2group[p])
-                )
-                self.device_states[p] = {}
                 state = self.state[p]
                 state["step"] = 0
-                state["host_grad_valid"] = False
                 if self.gradient_clipping is not None:
                     state["grad_norm"] = torch.tensor(0.0, device="cuda")
+                if p in self._inplace_params:
+                    p.register_post_accumulate_grad_hook(
+                        self._make_inplace_grad_hook(p, param2group[p])
+                    )
+                else:
+                    p.register_post_accumulate_grad_hook(
+                        self._make_grad_hook(p, param2group[p])
+                    )
+                    self.device_states[p] = {}
+                    state["host_grad_valid"] = False
 
     def _alloc_pinned_states(self, params, numa_node):
         total_bytes = 0
@@ -198,6 +223,27 @@ class OffloadAdam(Optimizer):
         if self.verbose > 0:
             print(
                 f"Pinned host memory allocated: {total_bytes / (1024 ** 3):.2f} GB"
+            )
+
+    def _alloc_inplace_states(self, params):
+        """Allocate optimizer states on GPU for params kept in-place.
+
+        Grad starts at zero and is zeroed after each step, so the grad-hook
+        can unconditionally `add_(p.grad)` without an adopt/accumulate flag.
+        """
+        total_bytes = 0
+        for p in params:
+            state = self.state[p]
+            for name, dtype in self.offload_config.items():
+                t = torch.zeros_like(p, dtype=dtype)
+                if name == "master_params":
+                    t.copy_(p.data)
+                state[name] = t
+                total_bytes += t.numel() * t.element_size()
+        if self.verbose > 0 and params:
+            print(
+                f"In-place GPU states for {len(params)} small params: "
+                f"{total_bytes / (1024 ** 2):.2f} MB"
             )
 
     # ------------------------------------------------------------------
@@ -272,13 +318,13 @@ class OffloadAdam(Optimizer):
             state["host_grad_valid"] = True
         p.grad = None
 
-    def _call_step_fn(self, p, group, chunk=None):
+    def _call_step_fn(self, p, group, device_states, chunk=None):
         state = self.state[p]
         param_view = p.data if chunk is None else p.data.view(-1)[chunk]
         beta1, beta2 = group["betas"]
         self.step_fn(
             param_view,
-            self.device_states[p],
+            device_states,
             group["lr"],
             group["weight_decay"],
             beta1,
@@ -295,9 +341,24 @@ class OffloadAdam(Optimizer):
         already on device from `_accumulate_grad_on_device`.
         """
         self._ensure_on_device(p, self._non_grad_keys)
-        self._call_step_fn(p, group)
+        self._call_step_fn(p, group, self.device_states[p])
         self._issue_d2h(p, self._non_grad_keys)
         self.device_states[p]["grad"] = None
+
+    def _step_inplace(self, p, group, clip_coef=None):
+        """Run the step for an in-place (small) param entirely on GPU.
+
+        State buffers are persistent on device, grad has been accumulated
+        into `state["grad"]` by the in-place grad hook. After step, grad is
+        zeroed so the next training step starts from a clean slate.
+        """
+        state = self.state[p]
+        if clip_coef is not None:
+            state["grad"].mul_(clip_coef)
+        self._call_step_fn(
+            p, group, {k: state[k] for k in self.offload_state_keys}
+        )
+        state["grad"].zero_()
 
     def _step_chunked(self, p, group, clip_coef=None):
         """Run the step for `p` in fixed-size chunks from `.step()`.
@@ -322,7 +383,7 @@ class OffloadAdam(Optimizer):
             self._ensure_on_device(p, self.offload_state_keys, chunk)
             if clip_coef is not None:
                 device_states["grad"].mul_(clip_coef)
-            self._call_step_fn(p, group, chunk)
+            self._call_step_fn(p, group, device_states, chunk)
             self._issue_d2h(p, self._non_grad_keys, chunk)
             device_states["grad"] = None
             pending.append(self.d2h_events[p])
@@ -335,6 +396,8 @@ class OffloadAdam(Optimizer):
 
     def _pre_backward_hook(self, module, grad_output):
         for p in module.parameters():
+            if p in self._inplace_params:
+                continue
             keys = []
             if self.state[p]["host_grad_valid"]:
                 keys.append("grad")
@@ -371,6 +434,32 @@ class OffloadAdam(Optimizer):
 
         return hook
 
+    def _make_inplace_grad_hook(self, p, group):
+        """Grad hook for small in-place params: no h2d/d2h, all on GPU.
+
+        `state["grad"]` is pre-zeroed; every micro-batch unconditionally
+        accumulates into it. On the last mb, step-in-backward path executes
+        the full step here; chunked path defers to `.step()`.
+        """
+        @torch.no_grad()
+        def hook(*_unused):
+            if p.grad is None:
+                return
+            state = self.state[p]
+            state["grad"].add_(p.grad)
+            p.grad = None
+
+            if self.gradient_clipping is not None and self.ready_for_optimizer_step:
+                state["grad_norm"] = torch.norm(
+                    state["grad"], self.gradient_clipping["norm_type"]
+                )
+
+            if self._step_in_backward and self.ready_for_optimizer_step:
+                state["step"] += 1
+                self._step_inplace(p, group)
+
+        return hook
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -399,8 +488,11 @@ class OffloadAdam(Optimizer):
             for p in group["params"]:
                 state = self.state[p]
                 state["step"] += 1
-                self._step_chunked(p, group, clip_coef=clip_coef)
-                state["host_grad_valid"] = False
+                if p in self._inplace_params:
+                    self._step_inplace(p, group, clip_coef=clip_coef)
+                else:
+                    self._step_chunked(p, group, clip_coef=clip_coef)
+                    state["host_grad_valid"] = False
 
     def zero_grad(self, set_to_none=False):
         """No-op; grads are managed by the hooks."""
