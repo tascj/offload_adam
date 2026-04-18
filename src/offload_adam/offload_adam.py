@@ -55,7 +55,7 @@ class OffloadAdam(Optimizer):
         decoupled_weight_decay (bool): Decouple weight decay from gradient
             (AdamW style). Default: False.
         step_chunk_size (int | None): Chunk size used by the `.step()` path
-            (only active when `gradient_clipping` is set). Default: 10M.
+            (only active when `gradient_clipping` is set). Default: 100M.
         verbose (int): Non-zero prints total pinned bytes allocated.
     """
 
@@ -97,7 +97,11 @@ class OffloadAdam(Optimizer):
         },
     }
 
-    _DEFAULT_STEP_CHUNK_SIZE = 1024 ** 2 * 10
+    _DEFAULT_STEP_CHUNK_SIZE = 1024 ** 2 * 100
+    # Max in-flight chunks before the chunked-step loop CPU-waits on the
+    # oldest d2h. K=2 gives full 3-stream (h2d/compute/d2h) overlap with
+    # peak device memory bounded to ~3× chunk_size.
+    _CHUNK_PIPELINE_DEPTH = 2
 
     def __init__(
         self,
@@ -210,7 +214,7 @@ class OffloadAdam(Optimizer):
         main_stream = torch.cuda.current_stream()
         device_states = self.device_states[p]
         if p in self.d2h_events:
-            self.d2h_events[p].synchronize()
+            self.h2d_stream.wait_event(self.d2h_events[p])
         self.h2d_stream.wait_stream(main_stream)
         for key in keys:
             with torch.cuda.stream(self.h2d_stream):
@@ -220,10 +224,11 @@ class OffloadAdam(Optimizer):
         self.h2d_events[p] = self.h2d_stream.record_event()
 
     def _issue_d2h(self, p, keys, chunk=None):
+        # No explicit wait on h2d_events[p]: every caller already routes the
+        # device tensor through main_stream (accumulate / step_fn), and
+        # wait_stream(main_stream) below propagates that h2d dependency.
         main_stream = torch.cuda.current_stream()
         device_states = self.device_states[p]
-        if p in self.h2d_events:
-            self.h2d_events[p].synchronize()
         self.d2h_stream.wait_stream(main_stream)
         for key in keys:
             with torch.cuda.stream(self.d2h_stream):
@@ -235,11 +240,12 @@ class OffloadAdam(Optimizer):
         self.d2h_events[p] = self.d2h_stream.record_event()
 
     def _ensure_on_device(self, p, keys, chunk=None):
-        """Block main stream on the pending h2d event; synchronously fetch any
-        key that wasn't prefetched."""
+        """Make the main stream wait for the pending h2d; synchronously fetch
+        any key that wasn't prefetched."""
+        main_stream = torch.cuda.current_stream()
         device_states = self.device_states[p]
         if p in self.h2d_events:
-            self.h2d_events[p].synchronize()
+            main_stream.wait_event(self.h2d_events[p])
         for key in keys:
             if device_states.get(key, None) is None:
                 device_states[key] = self._host_view(p, key, chunk).to(
@@ -299,9 +305,16 @@ class OffloadAdam(Optimizer):
         Each chunk pulls grad + non-grad states from host, optionally applies
         the global clip coefficient, runs the step, and writes non-grad states
         back. Chunking keeps peak device memory bounded for huge params.
+
+        Without the windowed CPU sync at the bottom, the per-chunk transfer
+        primitives are fully async: the caching allocator would issue a fresh
+        cudaMalloc per chunk and device memory would grow linearly with chunk
+        count. The sync caps in-flight chunks at `_CHUNK_PIPELINE_DEPTH`,
+        which is enough for full h2d/compute/d2h overlap.
         """
         size = p.numel()
         device_states = self.device_states[p]
+        pending = []
         for start in range(0, size, self.step_chunk_size):
             end = min(start + self.step_chunk_size, size)
             chunk = slice(start, end)
@@ -312,6 +325,9 @@ class OffloadAdam(Optimizer):
             self._call_step_fn(p, group, chunk)
             self._issue_d2h(p, self._non_grad_keys, chunk)
             device_states["grad"] = None
+            pending.append(self.d2h_events[p])
+            if len(pending) > self._CHUNK_PIPELINE_DEPTH:
+                pending.pop(0).synchronize()
 
     # ------------------------------------------------------------------
     # Layer 3 — hooks (the two strategies diverge here)
