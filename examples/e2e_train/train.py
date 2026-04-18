@@ -45,16 +45,15 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument(
-        "--gradient-clip-max-norm",
+        "--max-grad-norm",
         type=float,
         default=None,
         help=(
-            "Enable global-norm gradient clipping (OffloadAdam only). When set, "
-            "OffloadAdam runs the chunked .step() path; when None (default), it "
-            "runs the step-in-backward path."
+            "Enable L2 global-norm gradient clipping (OffloadAdam only). "
+            "When set, OffloadAdam runs the chunked .step() path; when None "
+            "(default), it runs the step-in-backward path."
         ),
     )
-    parser.add_argument("--gradient-clip-norm-type", type=float, default=2.0)
     parser.add_argument(
         "--numa-node",
         default="auto",
@@ -145,17 +144,11 @@ def build_optimizer(args, model):
             numa_node = None
         elif numa_node != "auto":
             numa_node = int(numa_node)
-        gradient_clipping = None
-        if args.gradient_clip_max_norm is not None:
-            gradient_clipping = dict(
-                max_norm=args.gradient_clip_max_norm,
-                norm_type=args.gradient_clip_norm_type,
-            )
         return OffloadAdam(
             model,
             numa_node=numa_node,
             verbose=1,
-            gradient_clipping=gradient_clipping,
+            max_grad_norm=args.max_grad_norm,
             prefetch_policy=args.prefetch_policy,
             **common,
         )

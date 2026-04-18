@@ -1,7 +1,7 @@
 """OffloadAdam: Adam with gradients and optimizer states offloaded to host memory.
 
 Two execution paths share the same transfer primitives and are selected by
-whether `gradient_clipping` is passed:
+whether `max_grad_norm` is set:
 
 - No clipping → step runs inside each param's post-accumulate-grad hook on
   the last micro-batch, overlapping load/compute/writeback with backward.
@@ -47,15 +47,16 @@ class OffloadAdam(Optimizer):
         mode (str): One of `'stochastic_rounding'`, `'fp32_master'`,
             `'fp31_master'`, `'fp32_master_custom_rounding'`. Default:
             `'stochastic_rounding'`.
-        gradient_clipping (dict | None): `{'max_norm': float, 'norm_type': float}`
-            for global-norm clipping. `None` disables clipping and routes the
-            step into the backward hook for maximum backward/step overlap.
+        max_grad_norm (float | None): If set, apply L2 global-norm clipping
+            with this max norm before the step. `None` (default) disables
+            clipping and routes the step into the backward hook for maximum
+            backward/step overlap.
         numa_node (str | int | None): NUMA policy for pinned allocations —
             `'auto'`, an int node id, or `None`.
         decoupled_weight_decay (bool): Decouple weight decay from gradient
             (AdamW style). Default: False.
         step_chunk_size (int | None): Chunk size used by the `.step()` path
-            (only active when `gradient_clipping` is set). Default: 100M.
+            (only active when `max_grad_norm` is set). Default: 100M.
         inplace_param_threshold (int | None): Params with fewer elements than
             this stay fully on GPU (states + grad), bypassing PCIe entirely.
             The default covers typical LLM normalization weights and biases
@@ -125,7 +126,7 @@ class OffloadAdam(Optimizer):
         eps=1e-8,
         weight_decay=0.01,
         mode="stochastic_rounding",
-        gradient_clipping=None,
+        max_grad_norm=None,
         numa_node="auto",
         decoupled_weight_decay=False,
         step_chunk_size=None,
@@ -148,17 +149,17 @@ class OffloadAdam(Optimizer):
         self.offload_state_keys = list(self.offload_config.keys())
         self._non_grad_keys = [k for k in self.offload_state_keys if k != "grad"]
 
-        self.gradient_clipping = gradient_clipping
-        # Without a clip spec we can fuse load/compute/writeback into backward
-        # hooks. Clipping needs a global norm, which forces the step back into
-        # `.step()` with a chunked loop.
-        self._step_in_backward = gradient_clipping is None
+        self.max_grad_norm = max_grad_norm
+        # Without clipping we fuse load/compute/writeback into backward
+        # hooks. Clipping needs a global norm, which forces the step back
+        # into `.step()` with a chunked loop.
+        self._step_in_backward = max_grad_norm is None
 
         if step_chunk_size is None:
             step_chunk_size = self._DEFAULT_STEP_CHUNK_SIZE
         elif self._step_in_backward:
             warnings.warn(
-                "step_chunk_size is ignored when gradient_clipping is None; "
+                "step_chunk_size is ignored when max_grad_norm is None; "
                 "the step runs per-parameter inside backward hooks.",
                 stacklevel=2,
             )
@@ -245,7 +246,7 @@ class OffloadAdam(Optimizer):
         for p in params:
             state = self.state[p]
             state["step"] = 0
-            if self.gradient_clipping is not None:
+            if self.max_grad_norm is not None:
                 state["grad_norm"] = torch.tensor(0.0, device="cuda")
             if p in self._inplace_params:
                 p.register_post_accumulate_grad_hook(self._inplace_grad_hook)
@@ -477,12 +478,11 @@ class OffloadAdam(Optimizer):
         state = self.state[p]
         group = self._param2group[p]
 
-        # Clipping path: record per-param norm; .step() reduces it into
+        # Clipping path: record per-param L2 norm; .step() reduces it into
         # the global norm and applies the clip coefficient chunk by chunk.
-        if self.gradient_clipping is not None and self.ready_for_optimizer_step:
+        if self.max_grad_norm is not None and self.ready_for_optimizer_step:
             state["grad_norm"] = torch.norm(
-                self.device_states[p]["grad"],
-                self.gradient_clipping["norm_type"],
+                self.device_states[p]["grad"], 2.0
             )
 
         # Step-in-backward path: run the whole step here on the last mb;
@@ -509,10 +509,8 @@ class OffloadAdam(Optimizer):
         state["grad"].add_(p.grad)
         p.grad = None
 
-        if self.gradient_clipping is not None and self.ready_for_optimizer_step:
-            state["grad_norm"] = torch.norm(
-                state["grad"], self.gradient_clipping["norm_type"]
-            )
+        if self.max_grad_norm is not None and self.ready_for_optimizer_step:
+            state["grad_norm"] = torch.norm(state["grad"], 2.0)
 
         if self._step_in_backward and self.ready_for_optimizer_step:
             state["step"] += 1
@@ -534,18 +532,15 @@ class OffloadAdam(Optimizer):
             return
 
         clip_coef = None
-        if self.gradient_clipping is not None:
+        if self.max_grad_norm is not None:
             norms = [
                 self.state[p]["grad_norm"]
                 for group in self.param_groups
                 for p in group["params"]
             ]
-            total_norm = torch.linalg.vector_norm(
-                torch.stack(norms), self.gradient_clipping["norm_type"]
-            )
+            total_norm = torch.linalg.vector_norm(torch.stack(norms), 2.0)
             clip_coef = torch.clamp(
-                self.gradient_clipping["max_norm"] / (total_norm + 1e-6),
-                max=1.0,
+                self.max_grad_norm / (total_norm + 1e-6), max=1.0
             )
 
         for group in self.param_groups:
