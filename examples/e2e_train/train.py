@@ -1,7 +1,7 @@
 """End-to-end training script with synthetic data.
 
 Loads a HuggingFace causal LM (default Qwen3-8B, optionally Liger-patched),
-feeds it random token batches, and runs Adam or OffloadAdamV2 from this
+feeds it random token batches, and runs Adam or OffloadAdam from this
 library. Reports per-step timing and a final JSON summary for easy
 aggregation across runs.
 """
@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM
 
-from offload_adam import Adam, OffloadAdamV2
+from offload_adam import Adam, OffloadAdam
 
 
 def parse_args():
@@ -25,7 +25,7 @@ def parse_args():
         "--enable-offloading",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use OffloadAdamV2 when enabled, plain Adam otherwise.",
+        help="Use OffloadAdam when enabled, plain Adam otherwise.",
     )
     parser.add_argument(
         "--mode",
@@ -45,9 +45,29 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=None,
+        help=(
+            "Enable L2 global-norm gradient clipping (OffloadAdam only). "
+            "When set, OffloadAdam runs the chunked .step() path; when None "
+            "(default), it runs the step-in-backward path."
+        ),
+    )
+    parser.add_argument(
         "--numa-node",
         default="auto",
         help="NUMA policy for pinned allocations: 'auto', an int node id, or 'none'.",
+    )
+    parser.add_argument(
+        "--prefetch-policy",
+        choices=["eager", "lazy"],
+        default="eager",
+        help=(
+            "OffloadAdam prefetch scheduling. 'eager' issues h2d at the "
+            "first pre_backward fire; 'lazy' restricts to the leaf module "
+            "that owns each param earliest in forward order."
+        ),
     )
     parser.add_argument(
         "--gradient-checkpointing",
@@ -124,10 +144,12 @@ def build_optimizer(args, model):
             numa_node = None
         elif numa_node != "auto":
             numa_node = int(numa_node)
-        return OffloadAdamV2(
+        return OffloadAdam(
             model,
             numa_node=numa_node,
             verbose=1,
+            max_grad_norm=args.max_grad_norm,
+            prefetch_policy=args.prefetch_policy,
             **common,
         )
     return Adam(model.parameters(), **common)

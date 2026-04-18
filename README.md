@@ -1,184 +1,99 @@
 # Offload Adam
 
-Adam optimizer that offloads gradients and optimizer states to CPU memory, enabling full-parameter training of larger models with limited GPU memory.
+Adam optimizer that keeps gradients and optimizer states in pinned host
+memory and streams them to the GPU only when they are needed for the step.
+Trades a small amount of throughput (when the step doesn't fully overlap
+backward) for the ability to do full-parameter training of much larger
+models on a single GPU.
 
-## Local development
-
-This repository is managed with `uv`.
-
-Create the local development environment:
+## Install
 
 ```bash
 uv sync
 ```
 
-Run ad-hoc checks from the project environment:
-
-```bash
-uv run python -c "import offload_adam; print(offload_adam.__version__)"
-uv run pytest
-uv run ruff check .
-```
-
-If you only want to refresh the lockfile after dependency changes:
-
-```bash
-uv lock
-```
-
-
 ## Usage
-
-### Adam
-
-```python
-from offload_adam import Adam
-
-# Create a model
-model = create_model().bfloat16().cuda()
-
-# Initialize the optimizer
-optimizer = Adam(
-    model.parameters(),
-    lr=0.001,
-    betas=(0.9, 0.999),
-    eps=1e-8,
-    weight_decay=0.01,
-    mode="stochastic_rounding",
-    decoupled_weight_decay=True,  # AdamW
-)
-
-# Training loop
-for input_data, target in dataloader:
-    # Forward pass
-    output = model(input_data)
-    loss = loss_function(output, target)
-    
-    # Backward pass
-    if gradient_accumulation:
-        loss.backward()
-    else:
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-```
-
-### OffloadAdam
 
 ```python
 from offload_adam import OffloadAdam
 
-# Create a model
-model = create_model().bfloat16().cuda()
+model = build_model().bfloat16().cuda()
 
-# Initialize the optimizer
 optimizer = OffloadAdam(
-    model,  # pass model instead of model.parameters()
-    lr=0.001,
-    betas=(0.9, 0.999),
-    eps=1e-8,
+    model,                         # pass the module, not its parameters
+    lr=1e-4,
     weight_decay=0.01,
-    mode="stochastic_rounding",
-    decoupled_weight_decay=True,  # AdamW
+    mode="fp32_master",            # see "Modes" below
+    decoupled_weight_decay=True,   # AdamW
+    max_grad_norm=1.0,             # optional L2 global-norm clipping
 )
 
-# Training loop
-for input_data, target in dataloader:
-    # Forward pass
-    output = model(input_data)
-    loss = loss_function(output, target)
-    
-
-    # Backward pass
-    if gradient_accumulation:
-        optimizer.ready_for_optimizer_step = False
+for step_batches in dataloader:    # outer iter = one optimizer step
+    for i, batch in enumerate(step_batches):
+        # The hook-driven step needs to know which microbatch is the last.
+        optimizer.ready_for_optimizer_step = i == len(step_batches) - 1
+        loss = model(**batch).loss / len(step_batches)
         loss.backward()
-    else:
-        optimizer.ready_for_optimizer_step = True
-        loss.backward()
-        optimizer.step()
+    optimizer.step()               # no-op without clipping (step ran in
+                                    # the backward hook); runs the chunked
+                                    # step when max_grad_norm is set
 ```
+
+`offload_adam.Adam` is the same Adam kernel without offloading, useful as a
+baseline for bf16 params (which `torch.optim.AdamW` does not handle).
+
+### Modes
+
+| `mode` | states stored on host | use when |
+|---|---|---|
+| `stochastic_rounding` (default) | bf16 grad + bf16 exp_avg / exp_avg_sq | smallest pinned footprint, slight noise from rounding |
+| `fp32_master` | adds fp32 master copy of params | bit-for-bit AdamW math, ~2× host memory |
+| `fp31_master` / `fp32_master_custom_rounding` | bf16 states + int16 rounding error | midway between the two above |
+
+### Useful knobs
+
+- `numa_node`: `'auto'` (default) binds pinned allocations to the GPU's NUMA
+  node. Pass an int to override or `None` to disable.
+- `inplace_param_threshold`: params smaller than this stay fully on GPU.
+  Default 1M elements (covers norm weights and biases). Set `0` to force
+  every param onto the offload path.
+- `prefetch_policy`: `'eager'` (default) starts h2d at the first
+  `pre_backward_hook` fire; `'lazy'` defers prefetch to the leaf module
+  that first owns each param in forward order. For shared params (tied
+  embeddings) `'lazy'` collapses GPU residency of the shared param's
+  non-grad states.
+
+## End-to-end example
+
+[`examples/e2e_train`](examples/e2e_train) trains a HuggingFace causal LM
+on synthetic data and reports per-step throughput and peak GPU memory:
+
+```bash
+uv sync --group examples
+uv run python examples/e2e_train/train.py \
+    --tokens-per-sample 4096 --grad-accum-steps 4 --steps 10
+```
+
+That directory's README has benchmarks across model sizes, sequence
+lengths, gradient accumulation, and rounding modes.
 
 ## How it works
 
-1. Module `register_full_backward_pre_hook`:
-    * asynchronously copy states from CPU to GPU
+`OffloadAdam` has two execution paths, selected by whether `max_grad_norm`
+is set:
 
-2. Parameter `register_post_accumulate_grad_hook`:
-    * gradient accumulation
-    * norm calculation for gradient clipping (in OffloadAdam)
-    * optimizer step (in OffloadAdamV2)
-    * asynchronously copy states back to CPU
+- **`max_grad_norm=None` (default)**: the per-param Adam step runs inside
+  that param's `post_accumulate_grad_hook` on the last microbatch. Loads,
+  compute, and writebacks overlap with the rest of backward, and
+  `optimizer.step()` is a no-op.
+- **`max_grad_norm=<float>`**: backward only accumulates gradients and
+  records per-param L2 norms. `optimizer.step()` reduces the global norm,
+  applies the clip coefficient, and walks each param in fixed-size chunks
+  (`step_chunk_size`) of load → compute → writeback. Chunking keeps peak
+  GPU memory bounded for very large params (e.g. embedding tables).
 
-Optimizer step is done on GPU.
-
-With offloading, it's possible do full-parameter training of:
-* 7B models using single 24GB GPU and 42GB+ host memory
-* 14B models using single 48GB GPU and 84GB+ host memory
-* 32B models using single 80GB GPU and 192GB+ host memory
-
-
-## Analysis
-
-The overhead of offloading depends on the input size (total number of tokens in a batch) and GPU compute speed.
-
-### Data transfer costs
-
-gradients, momentum and variance in BF16
-
-| Stage                 | H2D (bytes per param) | D2H (bytes per param) |
-|-----------------------|-----------------------|-----------------------|
-| gradient reset        | 0                     | 2                     |
-| gradient accumulation | 2                     | 2                     |
-| optimizer step (stochastic rounding) | 6      | 4                     |
-| optimizer step (fp32 master weights) | 10     | 8                     |
-
-### Overlapping data transfer and backward computation
-
-#### 1. nn.Linear
-
-Per-token backward time:
-
-$\frac{4 \times H_{in} \times H_{out}}{TFLOPS \times 10^{12}}$
-
-Weight transfer time:
-
-$\frac{H_{in} \times H_{out} \times 2}{Bandwidth_{GB/s} \times 10^9}$
-
-Number of tokens to overlap weight transfer:
-
-$\frac{H_{in} \times H_{out} \times 2}{Bandwidth_{GB/s} \times 10^9} \div \frac{4 \times H_{in} \times H_{out}}{TFLOPS \times 10^{12}}$
-
-$= \frac{TFLOPS \times 10^{12}}{2 \times Bandwidth_{GB/s} \times 10^9}$
-
-$= \frac{TFLOPS}{2 \times Bandwidth_{GB/s}} \times 1000$
-
-
-##### RTX4090 case
-
-With theoretical values (165 TFLOPS, 32 GB/s PCIe 4.0):
-* ~2578 tokens to overlap gradient transfer
-
-With measured values (175 TFLOPS, 25 GB/s):
-* ~3500 tokens to overlap gradient transfer
-
-![Linear](assets/linear_backward.png)
-
-In actual training, bandwidth will be lower.
-
-### 2. nn.Embedding
-
-Large memory consumption but small computational cost.
-
-Actual involved tokens are usually smaller than the full table:
-* For gradient accumulation, only used tokens in the current batch are involved.
-* For optimizer step, all ever used tokens are involved because of momentum.
-
-There are optimization chances but not implemented yet.
-
-## TODO
-
-- DTensor support
+Both paths share the same host↔device transfer primitives. The optimizer
+step itself always runs on GPU.
 
 ## References
 
