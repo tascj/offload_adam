@@ -458,6 +458,12 @@ class OffloadAdam(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        if closure is not None:
+            raise NotImplementedError(
+                "OffloadAdam does not support closure-based step: gradients "
+                "are consumed by backward hooks, so re-running backward "
+                "inside a closure would corrupt optimizer state."
+            )
         if self._step_in_backward:
             return
 
