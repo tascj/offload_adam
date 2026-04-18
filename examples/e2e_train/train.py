@@ -61,6 +61,16 @@ def parse_args():
         help="NUMA policy for pinned allocations: 'auto', an int node id, or 'none'.",
     )
     parser.add_argument(
+        "--prefetch-policy",
+        choices=["eager", "lazy"],
+        default="eager",
+        help=(
+            "OffloadAdam prefetch scheduling. 'eager' issues h2d at the "
+            "first pre_backward fire; 'lazy' restricts to the leaf module "
+            "that owns each param earliest in forward order."
+        ),
+    )
+    parser.add_argument(
         "--gradient-checkpointing",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -146,6 +156,7 @@ def build_optimizer(args, model):
             numa_node=numa_node,
             verbose=1,
             gradient_clipping=gradient_clipping,
+            prefetch_policy=args.prefetch_policy,
             **common,
         )
     return Adam(model.parameters(), **common)

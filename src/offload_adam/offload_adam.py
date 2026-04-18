@@ -62,6 +62,13 @@ class OffloadAdam(Optimizer):
             while leaving attention/MLP projections and embeddings on the
             offload path. Set `0` to force every param onto the offload path.
             Default: 1M elements.
+        prefetch_policy (str): `'eager'` (default) prefetches at the first
+            `pre_backward_hook` fire that sees a param. For params shared
+            across multiple leaf modules (tied embeddings) this pins the
+            non-grad states on GPU for the duration of backward. `'lazy'`
+            defers prefetch to the leaf module that owns each param
+            earliest in forward order — for shared params this collapses
+            the residency at a potential cost in PCIe/compute overlap.
         verbose (int): Non-zero prints total pinned bytes allocated.
     """
 
@@ -123,8 +130,15 @@ class OffloadAdam(Optimizer):
         decoupled_weight_decay=False,
         step_chunk_size=None,
         inplace_param_threshold=None,
+        prefetch_policy="eager",
         verbose=0,
     ):
+        if prefetch_policy not in ("eager", "lazy"):
+            raise ValueError(
+                f"prefetch_policy must be 'eager' or 'lazy' (got "
+                f"{prefetch_policy!r})"
+            )
+        self._prefetch_policy = prefetch_policy
         assert mode in self.supported_modes, (
             f"Invalid mode: {mode}, available modes: {list(self.supported_modes)}"
         )
@@ -155,9 +169,31 @@ class OffloadAdam(Optimizer):
         self.ready_for_optimizer_step = False
 
         modules = get_leaf_modules_with_params(model)
-        params = [
-            p for m in modules for p in m.parameters() if p.requires_grad
-        ]
+        # Dedupe by identity so tied embeddings don't enter the optimizer
+        # twice (chunked `.step()` would otherwise apply Adam twice).
+        seen = set()
+        params = []
+        module_count = {}
+        for m in modules:
+            for p in m.parameters():
+                if not p.requires_grad:
+                    continue
+                module_count[id(p)] = module_count.get(id(p), 0) + 1
+                if id(p) not in seen:
+                    seen.add(id(p))
+                    params.append(p)
+        shared_params = [p for p in params if module_count[id(p)] > 1]
+        if shared_params and self._prefetch_policy == "eager":
+            total_elems = sum(p.numel() for p in shared_params)
+            warnings.warn(
+                f"OffloadAdam: {len(shared_params)} parameter(s) shared "
+                f"across multiple leaf modules ({total_elems:,} elements; "
+                f"e.g. tied embeddings). With prefetch_policy='eager' their "
+                f"non-grad states sit on GPU through the whole backward. "
+                f"Pass prefetch_policy='lazy' to defer prefetch to the "
+                f"input-side module.",
+                stacklevel=2,
+            )
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
@@ -181,7 +217,15 @@ class OffloadAdam(Optimizer):
         self._param2group = {
             p: group for group in self.param_groups for p in group["params"]
         }
-        self._register_hooks(modules)
+        # First forward-ordered module that owns each offload param;
+        # 'lazy' policy gates prefetch on this so a shared param's
+        # h2d lands at its last backward fire, not its first.
+        self._prefetch_module = {}
+        for m in modules:
+            for p in m.parameters():
+                if p.requires_grad and p not in self._inplace_params:
+                    self._prefetch_module.setdefault(p, m)
+        self._register_hooks(modules, params)
         self._alloc_pinned_states(self._offload_params, numa_node)
         self._alloc_inplace_states(self._inplace_params)
 
@@ -189,28 +233,26 @@ class OffloadAdam(Optimizer):
     # Setup
     # ------------------------------------------------------------------
 
-    def _register_hooks(self, modules):
+    def _register_hooks(self, modules, params):
+        # pre_backward per-module (need module entry timing); grad hook
+        # per unique param so tied embeds don't get double-registered.
         for module in modules:
-            # Only modules with at least one offload param need the prefetch
-            # pre_backward_hook; an all-inplace module would just no-op.
             if any(
                 p.requires_grad and p not in self._inplace_params
                 for p in module.parameters()
             ):
                 module.register_full_backward_pre_hook(self._pre_backward_hook)
-            for p in module.parameters():
-                if not p.requires_grad:
-                    continue
-                state = self.state[p]
-                state["step"] = 0
-                if self.gradient_clipping is not None:
-                    state["grad_norm"] = torch.tensor(0.0, device="cuda")
-                if p in self._inplace_params:
-                    p.register_post_accumulate_grad_hook(self._inplace_grad_hook)
-                else:
-                    p.register_post_accumulate_grad_hook(self._grad_hook)
-                    self.device_states[p] = {}
-                    state["host_grad_valid"] = False
+        for p in params:
+            state = self.state[p]
+            state["step"] = 0
+            if self.gradient_clipping is not None:
+                state["grad_norm"] = torch.tensor(0.0, device="cuda")
+            if p in self._inplace_params:
+                p.register_post_accumulate_grad_hook(self._inplace_grad_hook)
+            else:
+                p.register_post_accumulate_grad_hook(self._grad_hook)
+                self.device_states[p] = {}
+                state["host_grad_valid"] = False
 
     def _alloc_pinned_states(self, params, numa_node):
         total_bytes = 0
@@ -405,14 +447,24 @@ class OffloadAdam(Optimizer):
     # ------------------------------------------------------------------
 
     def _pre_backward_hook(self, module, grad_output):
+        # `dev.get(...) is None` makes the hook idempotent across multiple
+        # fires per backward (tied embed: two modules; shared module: many
+        # invocations). Lazy adds a topology check to defer tied-embed
+        # prefetch to the input-side module.
+        lazy = self._prefetch_policy == "lazy"
         for p in module.parameters():
             if p in self._inplace_params:
                 continue
+            if lazy and self._prefetch_module.get(p) is not module:
+                continue
+            dev = self.device_states[p]
             keys = []
-            if self.state[p]["host_grad_valid"]:
+            if self.state[p]["host_grad_valid"] and dev.get("grad") is None:
                 keys.append("grad")
             if self._step_in_backward and self.ready_for_optimizer_step:
-                keys.extend(self._non_grad_keys)
+                keys.extend(
+                    k for k in self._non_grad_keys if dev.get(k) is None
+                )
             if keys:
                 self._issue_h2d(p, keys)
 
