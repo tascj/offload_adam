@@ -191,7 +191,13 @@ class OffloadAdam(Optimizer):
 
     def _register_hooks(self, modules):
         for module in modules:
-            module.register_full_backward_pre_hook(self._pre_backward_hook)
+            # Only modules with at least one offload param need the prefetch
+            # pre_backward_hook; an all-inplace module would just no-op.
+            if any(
+                p.requires_grad and p not in self._inplace_params
+                for p in module.parameters()
+            ):
+                module.register_full_backward_pre_hook(self._pre_backward_hook)
             for p in module.parameters():
                 if not p.requires_grad:
                     continue
@@ -216,7 +222,7 @@ class OffloadAdam(Optimizer):
                     t.copy_(p.data)
                 state[name] = t
                 total_bytes += t.numel() * t.element_size()
-        if self.verbose > 0:
+        if self.verbose > 0 and params:
             print(
                 f"Pinned host memory allocated: {total_bytes / (1024 ** 3):.2f} GB"
             )
@@ -283,7 +289,15 @@ class OffloadAdam(Optimizer):
 
     def _ensure_on_device(self, p, keys, chunk=None):
         """Make the main stream wait for the pending h2d; synchronously fetch
-        any key that wasn't prefetched."""
+        any key that wasn't prefetched.
+
+        The fallback fetch (when `device_states[key]` is None) is defensive:
+        under normal flow every key passed here was issued earlier by an
+        `_issue_h2d` (pre_backward_hook for overlapped path, _step_chunked
+        for chunked path). The fallback only matters if a caller bypasses
+        prefetch — e.g. if the user toggles `ready_for_optimizer_step` mid
+        backward.
+        """
         main_stream = torch.cuda.current_stream()
         device_states = self.device_states[p]
         if p in self.h2d_events:
