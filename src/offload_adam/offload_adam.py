@@ -178,10 +178,10 @@ class OffloadAdam(Optimizer):
         self.h2d_stream = torch.cuda.Stream()
         self.d2h_stream = torch.cuda.Stream()
 
-        param2group = {
+        self._param2group = {
             p: group for group in self.param_groups for p in group["params"]
         }
-        self._register_hooks(modules, param2group)
+        self._register_hooks(modules)
         self._alloc_pinned_states(self._offload_params, numa_node)
         self._alloc_inplace_states(self._inplace_params)
 
@@ -189,7 +189,7 @@ class OffloadAdam(Optimizer):
     # Setup
     # ------------------------------------------------------------------
 
-    def _register_hooks(self, modules, param2group):
+    def _register_hooks(self, modules):
         for module in modules:
             module.register_full_backward_pre_hook(self._pre_backward_hook)
             for p in module.parameters():
@@ -200,13 +200,9 @@ class OffloadAdam(Optimizer):
                 if self.gradient_clipping is not None:
                     state["grad_norm"] = torch.tensor(0.0, device="cuda")
                 if p in self._inplace_params:
-                    p.register_post_accumulate_grad_hook(
-                        self._make_inplace_grad_hook(p, param2group[p])
-                    )
+                    p.register_post_accumulate_grad_hook(self._inplace_grad_hook)
                 else:
-                    p.register_post_accumulate_grad_hook(
-                        self._make_grad_hook(p, param2group[p])
-                    )
+                    p.register_post_accumulate_grad_hook(self._grad_hook)
                     self.device_states[p] = {}
                     state["host_grad_valid"] = False
 
@@ -406,59 +402,55 @@ class OffloadAdam(Optimizer):
             if keys:
                 self._issue_h2d(p, keys)
 
-    def _make_grad_hook(self, p, group):
-        @torch.no_grad()
-        def hook(*_unused):
-            if p.grad is None:
-                return
+    @torch.no_grad()
+    def _grad_hook(self, p):
+        if p.grad is None:
+            return
 
-            self._accumulate_grad_on_device(p)
-            state = self.state[p]
+        self._accumulate_grad_on_device(p)
+        state = self.state[p]
+        group = self._param2group[p]
 
-            # Clipping path: record per-param norm; .step() reduces it into
-            # the global norm and applies the clip coefficient chunk by chunk.
-            if self.gradient_clipping is not None and self.ready_for_optimizer_step:
-                state["grad_norm"] = torch.norm(
-                    self.device_states[p]["grad"],
-                    self.gradient_clipping["norm_type"],
-                )
+        # Clipping path: record per-param norm; .step() reduces it into
+        # the global norm and applies the clip coefficient chunk by chunk.
+        if self.gradient_clipping is not None and self.ready_for_optimizer_step:
+            state["grad_norm"] = torch.norm(
+                self.device_states[p]["grad"],
+                self.gradient_clipping["norm_type"],
+            )
 
-            # Step-in-backward path: run the whole step here on the last mb;
-            # every other case just writes the accumulated grad back to host.
-            if self._step_in_backward and self.ready_for_optimizer_step:
-                state["step"] += 1
-                self._step_overlapped(p, group)
-                state["host_grad_valid"] = False
-            else:
-                self._issue_d2h(p, ["grad"])
+        # Step-in-backward path: run the whole step here on the last mb;
+        # every other case just writes the accumulated grad back to host.
+        if self._step_in_backward and self.ready_for_optimizer_step:
+            state["step"] += 1
+            self._step_overlapped(p, group)
+            state["host_grad_valid"] = False
+        else:
+            self._issue_d2h(p, ["grad"])
 
-        return hook
-
-    def _make_inplace_grad_hook(self, p, group):
+    @torch.no_grad()
+    def _inplace_grad_hook(self, p):
         """Grad hook for small in-place params: no h2d/d2h, all on GPU.
 
         `state["grad"]` is pre-zeroed; every micro-batch unconditionally
         accumulates into it. On the last mb, step-in-backward path executes
         the full step here; chunked path defers to `.step()`.
         """
-        @torch.no_grad()
-        def hook(*_unused):
-            if p.grad is None:
-                return
-            state = self.state[p]
-            state["grad"].add_(p.grad)
-            p.grad = None
+        if p.grad is None:
+            return
+        state = self.state[p]
+        group = self._param2group[p]
+        state["grad"].add_(p.grad)
+        p.grad = None
 
-            if self.gradient_clipping is not None and self.ready_for_optimizer_step:
-                state["grad_norm"] = torch.norm(
-                    state["grad"], self.gradient_clipping["norm_type"]
-                )
+        if self.gradient_clipping is not None and self.ready_for_optimizer_step:
+            state["grad_norm"] = torch.norm(
+                state["grad"], self.gradient_clipping["norm_type"]
+            )
 
-            if self._step_in_backward and self.ready_for_optimizer_step:
-                state["step"] += 1
-                self._step_inplace(p, group)
-
-        return hook
+        if self._step_in_backward and self.ready_for_optimizer_step:
+            state["step"] += 1
+            self._step_inplace(p, group)
 
     # ------------------------------------------------------------------
     # Public API
