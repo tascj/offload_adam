@@ -14,6 +14,7 @@ import warnings
 import torch
 from torch.optim.optimizer import Optimizer
 
+from ._pretrained import stream_master_from_pretrained
 from .kernels import (
     adam_step_fp31_master,
     adam_step_fp32_master,
@@ -21,6 +22,7 @@ from .kernels import (
     adam_step_stochastic_rounding,
 )
 from .pinned_alloc import zeros_pinned
+from .qweight.base import QWeightBase
 
 
 def get_leaf_modules_with_params(module):
@@ -198,12 +200,28 @@ class OffloadAdam(Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
+        # Quant params: fp32 master + re-quant via dispatch; not chunkable.
+        self._quant_params = {
+            p for p in params if isinstance(p.data, QWeightBase)
+        }
+        if self._quant_params and mode != "fp32_master":
+            raise ValueError(
+                f"QAT params require mode='fp32_master'; got {mode!r} "
+                f"({len(self._quant_params)} quant params detected)"
+            )
+        # One-shot warning flag (not persisted). The per-state
+        # `master_filled` bool is what survives state_dict round-trips.
+        self._quant_master_warned = False
+
         # Partition params: small ones stay fully on GPU; big ones get offloaded.
+        # Quant params are always offloaded — their master sits on host pinned.
         if inplace_param_threshold is None:
             inplace_param_threshold = self._DEFAULT_INPLACE_PARAM_THRESHOLD
         self.inplace_param_threshold = inplace_param_threshold
         self._inplace_params = {
-            p for p in params if p.numel() < inplace_param_threshold
+            p for p in params
+            if p.numel() < inplace_param_threshold
+            and p not in self._quant_params
         }
         self._offload_params = [
             p for p in params if p not in self._inplace_params
@@ -259,12 +277,17 @@ class OffloadAdam(Optimizer):
         total_bytes = 0
         for p in params:
             state = self.state[p]
+            is_quant = p in self._quant_params
             for name, dtype in self.offload_config.items():
                 t = zeros_pinned(p.shape, dtype, numa_node=numa_node)
                 if name == "master_params":
+                    # Quant: `copy_` dequantizes — lossy seed. Plain: lossless widen.
+                    # `master_filled=False` below flags lossy for load_master_from_pretrained.
                     t.copy_(p.data)
                 state[name] = t
                 total_bytes += t.numel() * t.element_size()
+            if is_quant and "master_params" in self.offload_config:
+                state["master_filled"] = False
         if self.verbose > 0 and params:
             print(
                 f"Pinned host memory allocated: {total_bytes / (1024 ** 3):.2f} GB"
@@ -373,8 +396,30 @@ class OffloadAdam(Optimizer):
 
     def _call_step_fn(self, p, group, device_states, chunk=None):
         state = self.state[p]
-        param_view = p.data if chunk is None else p.data.view(-1)[chunk]
         beta1, beta2 = group["betas"]
+        is_quant = p in self._quant_params
+        if (
+            is_quant
+            and not self._quant_master_warned
+            and state.get("master_filled") is False
+        ):
+            warnings.warn(
+                "OffloadAdam: quantized params running with a lossy "
+                "dequant-seeded fp32 master. For higher precision, call "
+                "`optim.load_master_from_pretrained("
+                "pretrained_name_or_path, model)` with the same "
+                "bf16/fp16 checkpoint `from_pretrained` used before "
+                "`quantize_linears` ran.",
+                stacklevel=2,
+            )
+            self._quant_master_warned = True  # warn once
+        if is_quant:
+            # bf16 master write-back would smash packed storage; redirect
+            # to grad (dummy sink) and re-quantize via `copy_` below.
+            assert chunk is None, "QAT params cannot be chunked"
+            param_view = device_states["grad"]
+        else:
+            param_view = p.data if chunk is None else p.data.view(-1)[chunk]
         self.step_fn(
             param_view,
             device_states,
@@ -386,6 +431,8 @@ class OffloadAdam(Optimizer):
             state["step"],
             decoupled_weight_decay=self.decoupled_weight_decay,
         )
+        if is_quant:
+            p.data.copy_(device_states["master_params"])
 
     def _step_overlapped(self, p, group):
         """Run the step for `p` from inside its grad hook.
@@ -412,6 +459,18 @@ class OffloadAdam(Optimizer):
             p, group, {k: state[k] for k in self.offload_state_keys}
         )
         state["grad"].zero_()
+
+    def _step_full(self, p, group, clip_coef=None):
+        """Unchunked ``.step()`` path. Used for quant params — packed
+        storage has no meaningful linear-index view to chunk across."""
+        device_states = self.device_states[p]
+        self._issue_h2d(p, self.offload_state_keys)
+        self._ensure_on_device(p, self.offload_state_keys)
+        if clip_coef is not None:
+            device_states["grad"].mul_(clip_coef)
+        self._call_step_fn(p, group, device_states)
+        self._issue_d2h(p, self._non_grad_keys)
+        device_states["grad"] = None
 
     def _step_chunked(self, p, group, clip_coef=None):
         """Run the step for `p` in fixed-size chunks from `.step()`.
@@ -549,10 +608,111 @@ class OffloadAdam(Optimizer):
                 state["step"] += 1
                 if p in self._inplace_params:
                     self._step_inplace(p, group, clip_coef=clip_coef)
+                    continue
+                if p in self._quant_params:
+                    self._step_full(p, group, clip_coef=clip_coef)
                 else:
                     self._step_chunked(p, group, clip_coef=clip_coef)
-                    state["host_grad_valid"] = False
+                state["host_grad_valid"] = False
 
     def zero_grad(self, set_to_none=False):
         """No-op; grads are managed by the hooks."""
         return
+
+    @torch.no_grad()
+    def load_master_state_dict(self, state_dict, model, strict=False):
+        """Overwrite `master_params` buffers from an in-memory
+        ``{name: tensor}`` mapping.
+
+        Advanced / test-time entry point — the canonical way to upgrade
+        the lossy dequant-seeded master to a lossless source is
+        ``load_master_from_pretrained``, which streams from disk.
+
+        Source tensors may be any float dtype (bf16 / fp16 / fp32);
+        they are copied into the optimizer's fp32 `master_params` —
+        narrower dtypes widen losslessly.
+
+        Args:
+            state_dict: ``{param_name: tensor}`` mapping.
+            model: Used to resolve param names.
+            strict: If True, raise ``ValueError`` on any name in
+                ``state_dict`` that doesn't match a trainable parameter
+                tracked by this optimizer.
+
+        Returns:
+            ``(unexpected_keys,)`` tuple — list of names in
+            ``state_dict`` that no param matched.
+        """
+        if "master_params" not in self.offload_config:
+            raise RuntimeError(
+                "load_master_state_dict requires a mode that maintains "
+                f"master_params (e.g. 'fp32_master'); current mode is {self.mode!r}."
+            )
+        name2param = {
+            n: p for n, p in model.named_parameters() if p.requires_grad
+        }
+        unexpected = []
+        for name, tensor in state_dict.items():
+            p = name2param.get(name)
+            if p is None or p not in self.state:
+                unexpected.append(name)
+                continue
+            state = self.state[p]
+            state["master_params"].copy_(tensor)
+            # Loaded → mark filled so the step-time warning skips this
+            # param. Persisted via `Optimizer.state_dict()`.
+            if "master_filled" in state:
+                state["master_filled"] = True
+        if strict and unexpected:
+            raise ValueError(
+                "load_master_state_dict(strict=True): no param matches "
+                f"{len(unexpected)} key(s): {unexpected}"
+            )
+        return (unexpected,)
+
+    @torch.no_grad()
+    def load_master_from_pretrained(
+        self, pretrained_name_or_path, model, *, strict=False,
+    ):
+        """Refill the fp32 master from a ``from_pretrained``-style
+        checkpoint (single file, sharded directory, or HF Hub repo ID).
+
+        Reads each tensor once from the on-disk bf16/fp16 checkpoint,
+        widens to fp32 as it copies into ``state[p]["master_params"]``
+        (lossless), and releases the read buffer before moving on —
+        per-layer peak host memory stays bounded. Only acts on params
+        whose ``p.data`` is a ``QWeightBase`` subclass; non-quant
+        params already got the same widen at optimizer init.
+
+        Args:
+            pretrained_name_or_path: Same shape
+                ``AutoModelForCausalLM.from_pretrained`` accepts — a
+                local file, a local directory (single or sharded), or a
+                HuggingFace Hub repo ID (resolved via
+                ``huggingface_hub``).
+            model: Used to resolve key → ``Parameter``.
+            strict: If True, raise ``ValueError`` when one or more quant
+                params have no matching key across the provided files.
+
+        Returns:
+            Sorted list of quant param names that had no match across
+            the provided files. Empty list means every quant master was
+            refilled losslessly.
+        """
+        if "master_params" not in self.offload_config:
+            raise RuntimeError(
+                "load_master_from_pretrained requires a mode that "
+                "maintains master_params (e.g. 'fp32_master'); current "
+                f"mode is {self.mode!r}."
+            )
+        return stream_master_from_pretrained(
+            self, pretrained_name_or_path, model, strict=strict,
+        )
+
+    def load_state_dict(self, state_dict):
+        raise NotImplementedError(
+            "OffloadAdam.load_state_dict is not supported: the default "
+            "Optimizer.load_state_dict would move pinned-host state to "
+            "GPU and cast fp32 master to bf16, defeating the offload "
+            "contract. File an issue if resume is needed."
+        )
