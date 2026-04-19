@@ -63,19 +63,14 @@ baseline for bf16 params (which `torch.optim.AdamW` does not handle).
   embeddings) `'lazy'` collapses GPU residency of the shared param's
   non-grad states.
 
-## End-to-end example
+## Examples
 
-[`examples/e2e_train`](examples/e2e_train) trains a HuggingFace causal LM
-on synthetic data and reports per-step throughput and peak GPU memory:
-
-```bash
-uv sync --group examples
-uv run python examples/e2e_train/train.py \
-    --tokens-per-sample 4096 --grad-accum-steps 4 --steps 10
-```
-
-That directory's README has benchmarks across model sizes, sequence
-lengths, gradient accumulation, and rounding modes.
+- [`examples/e2e_train`](examples/e2e_train) — end-to-end training of a
+  HuggingFace causal LM on synthetic data; throughput and peak-memory
+  benchmarks across model sizes, sequence lengths, and rounding modes.
+- [`examples/qat`](examples/qat) — quantization-aware training with
+  int4 / int8 / NF4 / NVFP4 weight-only quantization on top of
+  `OffloadAdam`.
 
 ## How it works
 
