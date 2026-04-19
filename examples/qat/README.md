@@ -136,9 +136,8 @@ offloaded master, so `Adam → OffloadAdam → +int4` compounds into a
 
 ## Storage layouts
 
-Each subclass stores data in the layout the corresponding vllm loader
-expects, and `model.state_dict()` emits per-dtype canonical keys
-(end-to-end loading into vllm is not yet CI-verified):
+Each subclass stores data in the layout the corresponding vLLM loader
+expects, and `model.state_dict()` emits per-dtype canonical keys:
 
 - `Int4QWeight` → GPTQ raw layout (`qweight (in_f//8, out_f) int32`,
   `scales (n_groups, out_f)`; symmetric `qzeros` synthesized at save).
@@ -150,3 +149,24 @@ expects, and `model.state_dict()` emits per-dtype canonical keys
 - `NVFP4QWeight` → compressed-tensors NVFP4 (`weight_packed (out_f,
   in_f//2) uint8`, `block_scale_fp8 (out_f, n_groups) fp8_e4m3`,
   `global_scale () fp32`, even → low nibble).
+
+## Exporting for vLLM
+
+`quantize_linears(..., update_hf_config=True)` sets
+`model.config.quantization_config` so a subsequent
+`model.save_pretrained(path)` produces a checkpoint vLLM can load
+directly. For a one-shot save without mutating the model, call
+`save_quantized_pretrained(model, path, weight_cls, skip_patterns=...,
+**kwargs)`:
+
+```python
+from offload_adam.qweight import Int4QWeight, save_quantized_pretrained
+save_quantized_pretrained(
+    model, "my_int4_ckpt", Int4QWeight,
+    skip_patterns=("lm_head",), group_size=128,
+)
+# Tokenizer goes alongside:
+tokenizer.save_pretrained("my_int4_ckpt")
+```
+
+Manually verified with vLLM 0.19.1 on Qwen3-8B across all four dtypes.
