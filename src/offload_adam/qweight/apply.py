@@ -4,7 +4,9 @@ plain tensors (safetensors- / ``weights_only=True``-friendly) and
 ``load_state_dict`` reconstructs the subclass on the way back in.
 """
 
-from typing import List, NamedTuple, Optional, Tuple, Type
+import json
+from pathlib import Path
+from typing import List, NamedTuple, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -80,6 +82,7 @@ def quantize_linears(
     skip_patterns: Tuple[str, ...] = (),
     device: Optional[str] = None,
     strict: bool = False,
+    update_hf_config: bool = False,
     **weight_kwargs,
 ) -> QuantizeReport:
     """Replace eligible Linear weights with `weight_cls` instances in place.
@@ -98,6 +101,11 @@ def quantize_linears(
             by ``weight_cls.can_quantize`` (shape / dtype mismatch).
             Excluded layers (matched ``skip_patterns``) are always OK
             since they are an explicit user choice.
+        update_hf_config: If True and ``model`` has a ``config``
+            attribute (HuggingFace ``PretrainedConfig``), set
+            ``model.config.quantization_config`` so a later
+            ``model.save_pretrained`` writes the right routing hint
+            into ``config.json``.
         **weight_kwargs: Passed through to ``weight_cls.from_float`` and
             ``weight_cls.can_quantize`` (e.g. ``group_size=128``).
 
@@ -136,6 +144,35 @@ def quantize_linears(
             f"quantize_linears(strict=True) rejected "
             f"{len(incompatible)} layer(s): {reasons}"
         )
+    if update_hf_config and hasattr(model, "config"):
+        model.config.quantization_config = weight_cls.build_hf_quantization_config(
+            skip_patterns=skip_patterns, **weight_kwargs,
+        )
     return QuantizeReport(
         quantized=quantized, incompatible=incompatible, excluded=excluded,
     )
+
+
+def save_quantized_pretrained(
+    model: nn.Module,
+    save_directory: Union[str, Path],
+    weight_cls: Type[QWeightBase],
+    skip_patterns: Tuple[str, ...] = (),
+    **weight_kwargs,
+) -> None:
+    """Save a quantized HF model and patch ``config.json`` with the
+    matching ``quantization_config``.
+
+    Calls ``model.save_pretrained(save_directory)``, then merges
+    ``weight_cls.build_hf_quantization_config(skip_patterns=..., **weight_kwargs)``
+    into the saved ``config.json``. Use this instead of a plain
+    ``save_pretrained`` when you have not passed ``update_hf_config=True``
+    to ``quantize_linears``."""
+    save_dir = Path(save_directory)
+    model.save_pretrained(save_dir)
+    cfg_path = save_dir / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["quantization_config"] = weight_cls.build_hf_quantization_config(
+        skip_patterns=skip_patterns, **weight_kwargs,
+    )
+    cfg_path.write_text(json.dumps(cfg, indent=2))

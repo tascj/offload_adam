@@ -107,3 +107,16 @@ class QWeightBase(Tensor):
         plain tensors (e.g. `outer_dtype` for nf4/nvfp4) pull that info
         from `reference`."""
         raise NotImplementedError
+
+    @classmethod
+    def build_hf_quantization_config(
+        cls, skip_patterns=(), **weight_kwargs,
+    ) -> dict:
+        """HF-style ``quantization_config`` dict for this subclass.
+
+        Placed in ``config.json`` so vllm / HF transformers route the
+        state_dict through the matching loader (gptq / bitsandbytes /
+        compressed-tensors). ``skip_patterns`` map to each method's
+        skip field (``modules_to_not_convert`` / ``ignore`` / ...).
+        ``weight_kwargs`` are the same ones passed to ``from_float``."""
+        raise NotImplementedError

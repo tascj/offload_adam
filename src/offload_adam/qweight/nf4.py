@@ -444,6 +444,19 @@ class NF4QWeight(QWeightBase):
         absmax = plain["weight.absmax"]
         return cls(weight_packed, absmax, in_f, blocksize, outer_dtype)
 
+    @classmethod
+    def build_hf_quantization_config(
+        cls, skip_patterns=(), compute_dtype: str = "bfloat16", **_,
+    ) -> dict:
+        return {
+            "quant_method": "bitsandbytes",
+            "load_in_4bit": True,
+            "bnb_4bit_quant_type": "nf4",
+            "bnb_4bit_use_double_quant": False,
+            "bnb_4bit_compute_dtype": compute_dtype,
+            "llm_int8_skip_modules": list(skip_patterns),
+        }
+
     def __repr__(self):
         return (
             f"NF4QWeight(shape={tuple(self.shape)}, dtype={self.dtype}, "

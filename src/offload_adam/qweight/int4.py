@@ -371,6 +371,19 @@ class Int4QWeight(QWeightBase):
         group_size = in_f // scales.shape[0]
         return cls(qweight, scales, group_size)
 
+    @classmethod
+    def build_hf_quantization_config(
+        cls, skip_patterns=(), group_size: int = 128, **_,
+    ) -> dict:
+        return {
+            "quant_method": "gptq",
+            "bits": 4,
+            "group_size": group_size,
+            "desc_act": False,
+            "sym": True,
+            "modules_to_not_convert": list(skip_patterns),
+        }
+
     def __repr__(self):
         return (
             f"Int4QWeight(shape={tuple(self.shape)}, dtype={self.dtype}, "

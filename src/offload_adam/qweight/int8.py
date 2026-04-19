@@ -310,6 +310,25 @@ class Int8QWeight(QWeightBase):
         weight = (u.reshape(out_f, in_f) - 128).to(torch.int8)  # undo zero-point 128
         return cls(weight, scale)
 
+    @classmethod
+    def build_hf_quantization_config(cls, skip_patterns=(), **_) -> dict:
+        return {
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "config_groups": {
+                "group_0": {
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "int",
+                        "symmetric": True,
+                        "strategy": "channel",
+                    },
+                    "targets": ["Linear"],
+                },
+            },
+            "ignore": list(skip_patterns),
+        }
+
     def __repr__(self):
         return (
             f"Int8QWeight(shape={tuple(self.shape)}, dtype={self.dtype}, "

@@ -696,6 +696,26 @@ class NVFP4QWeight(QWeightBase):
         in_f = weight_packed.shape[1] * 2
         return cls(weight_packed, block_scale, global_scale, in_f, reference.outer_dtype)
 
+    @classmethod
+    def build_hf_quantization_config(cls, skip_patterns=(), **_) -> dict:
+        return {
+            "quant_method": "compressed-tensors",
+            "format": "nvfp4-pack-quantized",
+            "config_groups": {
+                "group_0": {
+                    "weights": {
+                        "num_bits": 4,
+                        "type": "float",
+                        "symmetric": True,
+                        "strategy": "tensor_group",
+                        "group_size": NVFP4_BLOCKSIZE,
+                    },
+                    "targets": ["Linear"],
+                },
+            },
+            "ignore": list(skip_patterns),
+        }
+
     def __repr__(self):
         return (
             f"NVFP4QWeight(shape={tuple(self.shape)}, dtype={self.dtype}, "
