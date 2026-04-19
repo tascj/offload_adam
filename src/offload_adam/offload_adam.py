@@ -6,7 +6,7 @@ whether `max_grad_norm` is set:
 - No clipping → step runs inside each param's post-accumulate-grad hook on
   the last micro-batch, overlapping load/compute/writeback with backward.
 - Clipping → backward only accumulates grad and per-param norms; the full
-  step loop (global clip, chunked load/compute/writeback) runs in `.step()`.
+  step loop (global clip, load/compute/writeback) runs in `.step()`.
 """
 
 import warnings
@@ -57,8 +57,6 @@ class OffloadAdam(Optimizer):
             `'auto'`, an int node id, or `None`.
         decoupled_weight_decay (bool): Decouple weight decay from gradient
             (AdamW style). Default: False.
-        step_chunk_size (int | None): Chunk size used by the `.step()` path
-            (only active when `max_grad_norm` is set). Default: 100M.
         inplace_param_threshold (int | None): Params with fewer elements than
             this stay fully on GPU (states + grad), bypassing PCIe entirely.
             The default covers typical LLM normalization weights and biases
@@ -113,12 +111,7 @@ class OffloadAdam(Optimizer):
         },
     }
 
-    _DEFAULT_STEP_CHUNK_SIZE = 1024 ** 2 * 100
     _DEFAULT_INPLACE_PARAM_THRESHOLD = 1024 * 1024
-    # Max in-flight chunks before the chunked-step loop CPU-waits on the
-    # oldest d2h. K=2 gives full 3-stream (h2d/compute/d2h) overlap with
-    # peak device memory bounded to ~3× chunk_size.
-    _CHUNK_PIPELINE_DEPTH = 2
 
     def __init__(
         self,
@@ -131,7 +124,6 @@ class OffloadAdam(Optimizer):
         max_grad_norm=None,
         numa_node="auto",
         decoupled_weight_decay=False,
-        step_chunk_size=None,
         inplace_param_threshold=None,
         prefetch_policy="eager",
         verbose=0,
@@ -154,18 +146,8 @@ class OffloadAdam(Optimizer):
         self.max_grad_norm = max_grad_norm
         # Without clipping we fuse load/compute/writeback into backward
         # hooks. Clipping needs a global norm, which forces the step back
-        # into `.step()` with a chunked loop.
+        # into `.step()`.
         self._step_in_backward = max_grad_norm is None
-
-        if step_chunk_size is None:
-            step_chunk_size = self._DEFAULT_STEP_CHUNK_SIZE
-        elif self._step_in_backward:
-            warnings.warn(
-                "step_chunk_size is ignored when max_grad_norm is None; "
-                "the step runs per-parameter inside backward hooks.",
-                stacklevel=2,
-            )
-        self.step_chunk_size = step_chunk_size
 
         self.decoupled_weight_decay = decoupled_weight_decay
         self.verbose = verbose
@@ -173,7 +155,7 @@ class OffloadAdam(Optimizer):
 
         modules = get_leaf_modules_with_params(model)
         # Dedupe by identity so tied embeddings don't enter the optimizer
-        # twice (chunked `.step()` would otherwise apply Adam twice).
+        # twice (`.step()` would otherwise apply Adam twice).
         seen = set()
         params = []
         module_count = {}
@@ -200,7 +182,7 @@ class OffloadAdam(Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
-        # Quant params: fp32 master + re-quant via dispatch; not chunkable.
+        # Quant params: fp32 master + re-quant via dispatch.
         self._quant_params = {
             p for p in params if isinstance(p.data, QWeightBase)
         }
@@ -318,13 +300,10 @@ class OffloadAdam(Optimizer):
     # Layer 1 — transfer primitives
     # ------------------------------------------------------------------
 
-    def _host_view(self, p, name, chunk=None):
-        t = self.state[p][name]
-        if chunk is not None:
-            t = t.view(-1)[chunk]
-        return t
+    def _host_view(self, p, name):
+        return self.state[p][name]
 
-    def _issue_h2d(self, p, keys, chunk=None):
+    def _issue_h2d(self, p, keys):
         main_stream = torch.cuda.current_stream()
         device_states = self.device_states[p]
         if p in self.d2h_events:
@@ -332,12 +311,12 @@ class OffloadAdam(Optimizer):
         self.h2d_stream.wait_stream(main_stream)
         for key in keys:
             with torch.cuda.stream(self.h2d_stream):
-                device_states[key] = self._host_view(p, key, chunk).to(
+                device_states[key] = self._host_view(p, key).to(
                     p.device, non_blocking=True
                 )
         self.h2d_events[p] = self.h2d_stream.record_event()
 
-    def _issue_d2h(self, p, keys, chunk=None):
+    def _issue_d2h(self, p, keys):
         # No explicit wait on h2d_events[p]: every caller already routes the
         # device tensor through main_stream (accumulate / step_fn), and
         # wait_stream(main_stream) below propagates that h2d dependency.
@@ -346,33 +325,22 @@ class OffloadAdam(Optimizer):
         self.d2h_stream.wait_stream(main_stream)
         for key in keys:
             with torch.cuda.stream(self.d2h_stream):
-                self._host_view(p, key, chunk).copy_(
+                self._host_view(p, key).copy_(
                     device_states[key], non_blocking=True
                 )
             device_states[key].record_stream(self.d2h_stream)
             device_states[key] = None
         self.d2h_events[p] = self.d2h_stream.record_event()
 
-    def _ensure_on_device(self, p, keys, chunk=None):
-        """Make the main stream wait for the pending h2d; synchronously fetch
-        any key that wasn't prefetched.
-
-        The fallback fetch (when `device_states[key]` is None) is defensive:
-        under normal flow every key passed here was issued earlier by an
-        `_issue_h2d` (pre_backward_hook for overlapped path, _step_chunked
-        for chunked path). The fallback only matters if a caller bypasses
-        prefetch — e.g. if the user toggles `ready_for_optimizer_step` mid
-        backward.
-        """
-        main_stream = torch.cuda.current_stream()
+    def _ensure_on_device(self, p, keys):
+        """Issue h2d for any `keys` not yet on device, then make
+        main_stream wait on the h2d event."""
         device_states = self.device_states[p]
+        missing = [k for k in keys if device_states.get(k) is None]
+        if missing:
+            self._issue_h2d(p, missing)
         if p in self.h2d_events:
-            main_stream.wait_event(self.h2d_events[p])
-        for key in keys:
-            if device_states.get(key, None) is None:
-                device_states[key] = self._host_view(p, key, chunk).to(
-                    p.device, non_blocking=True
-                )
+            torch.cuda.current_stream().wait_event(self.h2d_events[p])
 
     # ------------------------------------------------------------------
     # Layer 2 — compound per-param ops
@@ -394,7 +362,7 @@ class OffloadAdam(Optimizer):
             state["host_grad_valid"] = True
         p.grad = None
 
-    def _call_step_fn(self, p, group, device_states, chunk=None):
+    def _call_step_fn(self, p, group, device_states):
         state = self.state[p]
         beta1, beta2 = group["betas"]
         is_quant = p in self._quant_params
@@ -416,10 +384,9 @@ class OffloadAdam(Optimizer):
         if is_quant:
             # bf16 master write-back would smash packed storage; redirect
             # to grad (dummy sink) and re-quantize via `copy_` below.
-            assert chunk is None, "QAT params cannot be chunked"
             param_view = device_states["grad"]
         else:
-            param_view = p.data if chunk is None else p.data.view(-1)[chunk]
+            param_view = p.data
         self.step_fn(
             param_view,
             device_states,
@@ -434,16 +401,15 @@ class OffloadAdam(Optimizer):
         if is_quant:
             p.data.copy_(device_states["master_params"])
 
-    def _step_overlapped(self, p, group):
-        """Run the step for `p` from inside its grad hook.
-
-        Non-grad states were prefetched in `_pre_backward_hook`; grad is
-        already on device from `_accumulate_grad_on_device`.
-        """
-        self._ensure_on_device(p, self._non_grad_keys)
-        self._call_step_fn(p, group, self.device_states[p])
+    def _step_offload(self, p, group, clip_coef=None):
+        """PCIe-mediated step: ensure state on device → kernel → d2h."""
+        device_states = self.device_states[p]
+        self._ensure_on_device(p, self.offload_state_keys)
+        if clip_coef is not None:
+            device_states["grad"].mul_(clip_coef)
+        self._call_step_fn(p, group, device_states)
         self._issue_d2h(p, self._non_grad_keys)
-        self.device_states[p]["grad"] = None
+        device_states["grad"] = None
 
     def _step_inplace(self, p, group, clip_coef=None):
         """Run the step for an in-place (small) param entirely on GPU.
@@ -459,48 +425,6 @@ class OffloadAdam(Optimizer):
             p, group, {k: state[k] for k in self.offload_state_keys}
         )
         state["grad"].zero_()
-
-    def _step_full(self, p, group, clip_coef=None):
-        """Unchunked ``.step()`` path. Used for quant params — packed
-        storage has no meaningful linear-index view to chunk across."""
-        device_states = self.device_states[p]
-        self._issue_h2d(p, self.offload_state_keys)
-        self._ensure_on_device(p, self.offload_state_keys)
-        if clip_coef is not None:
-            device_states["grad"].mul_(clip_coef)
-        self._call_step_fn(p, group, device_states)
-        self._issue_d2h(p, self._non_grad_keys)
-        device_states["grad"] = None
-
-    def _step_chunked(self, p, group, clip_coef=None):
-        """Run the step for `p` in fixed-size chunks from `.step()`.
-
-        Each chunk pulls grad + non-grad states from host, optionally applies
-        the global clip coefficient, runs the step, and writes non-grad states
-        back. Chunking keeps peak device memory bounded for huge params.
-
-        Without the windowed CPU sync at the bottom, the per-chunk transfer
-        primitives are fully async: the caching allocator would issue a fresh
-        cudaMalloc per chunk and device memory would grow linearly with chunk
-        count. The sync caps in-flight chunks at `_CHUNK_PIPELINE_DEPTH`,
-        which is enough for full h2d/compute/d2h overlap.
-        """
-        size = p.numel()
-        device_states = self.device_states[p]
-        pending = []
-        for start in range(0, size, self.step_chunk_size):
-            end = min(start + self.step_chunk_size, size)
-            chunk = slice(start, end)
-            self._issue_h2d(p, self.offload_state_keys, chunk)
-            self._ensure_on_device(p, self.offload_state_keys, chunk)
-            if clip_coef is not None:
-                device_states["grad"].mul_(clip_coef)
-            self._call_step_fn(p, group, device_states, chunk)
-            self._issue_d2h(p, self._non_grad_keys, chunk)
-            device_states["grad"] = None
-            pending.append(self.d2h_events[p])
-            if len(pending) > self._CHUNK_PIPELINE_DEPTH:
-                pending.pop(0).synchronize()
 
     # ------------------------------------------------------------------
     # Layer 3 — hooks (the two strategies diverge here)
@@ -538,7 +462,7 @@ class OffloadAdam(Optimizer):
         group = self._param2group[p]
 
         # Clipping path: record per-param L2 norm; .step() reduces it into
-        # the global norm and applies the clip coefficient chunk by chunk.
+        # the global norm and applies the clip coefficient at step time.
         if self.max_grad_norm is not None and self.ready_for_optimizer_step:
             state["grad_norm"] = torch.norm(
                 self.device_states[p]["grad"], 2.0
@@ -548,7 +472,7 @@ class OffloadAdam(Optimizer):
         # every other case just writes the accumulated grad back to host.
         if self._step_in_backward and self.ready_for_optimizer_step:
             state["step"] += 1
-            self._step_overlapped(p, group)
+            self._step_offload(p, group)
             state["host_grad_valid"] = False
         else:
             self._issue_d2h(p, ["grad"])
@@ -559,7 +483,7 @@ class OffloadAdam(Optimizer):
 
         `state["grad"]` is pre-zeroed; every micro-batch unconditionally
         accumulates into it. On the last mb, step-in-backward path executes
-        the full step here; chunked path defers to `.step()`.
+        the full step here; clipping path defers to `.step()`.
         """
         if p.grad is None:
             return
@@ -608,12 +532,9 @@ class OffloadAdam(Optimizer):
                 state["step"] += 1
                 if p in self._inplace_params:
                     self._step_inplace(p, group, clip_coef=clip_coef)
-                    continue
-                if p in self._quant_params:
-                    self._step_full(p, group, clip_coef=clip_coef)
                 else:
-                    self._step_chunked(p, group, clip_coef=clip_coef)
-                state["host_grad_valid"] = False
+                    self._step_offload(p, group, clip_coef=clip_coef)
+                    state["host_grad_valid"] = False
 
     def zero_grad(self, set_to_none=False):
         """No-op; grads are managed by the hooks."""
