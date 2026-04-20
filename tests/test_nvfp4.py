@@ -21,6 +21,7 @@ from offload_adam.qweight.nvfp4 import (
     NVFP4QWeight,
     _dequant_nvfp4_triton,
     _fp4_lut,
+    _fp8_e4m3_bits_to_fp32,
     _quantize_fp4_e2m1_rne,
     _quantize_nvfp4_triton,
     pack_fp4,
@@ -29,6 +30,11 @@ from offload_adam.qweight.nvfp4 import (
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+BLACKWELL = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not _nvfp4_mod._supports_native_fp4(),
+    reason="Blackwell (sm_100+) required for native-vs-fallback parity",
+)
 
 
 # -------- pack / unpack convention --------------------------------------
@@ -176,7 +182,7 @@ def test_quantize_triton_parity(out_f, in_f, src_dtype):
     assert torch.equal(
         got_scale.to(torch.float32), ref_scale.to(torch.float32),
     )
-    # With RNE-matching software reference, hardware and LUT paths
+    # With RNE-matching software reference, hardware and soft bit-op paths
     # now produce byte-identical packed output.
     assert torch.equal(got_packed, ref_packed), (
         f"packed mismatch: shape=({out_f},{in_f}) dtype={src_dtype} "
@@ -319,7 +325,7 @@ def test_rne_quantize_boundaries(sign):
     )
 
 
-@CUDA
+@BLACKWELL
 def test_large_random_stress_matches_native():
     """1M random fp32 values spanning [-8, 8] (includes saturation,
     near-boundary, and ±0). Software fallback must bit-equal native
@@ -350,7 +356,7 @@ def test_large_random_stress_matches_native():
     assert _nvfp4_mod._supports_native_fp4()
     pk_n, sc_n, gs_n = _quantize_nvfp4_triton(w)
 
-    # Fallback path (force LUT)
+    # Fallback path (force soft)
     orig = _nvfp4_mod._supports_native_fp4
     _nvfp4_mod._supports_native_fp4 = lambda: False
     try:
@@ -374,11 +380,11 @@ def test_can_quantize():
     assert not NVFP4QWeight.can_quantize(torch.empty(4, 15))   # < blocksize
 
 
-# -------- fallback (LUT) path parity -----------------------------------
+# -------- fallback (soft bit-op) path parity ---------------------------
 
-@CUDA
-def test_native_vs_lut_fallback_parity(monkeypatch):
-    """Blackwell-native PTX and the LUT software fallback must produce
+@BLACKWELL
+def test_native_vs_soft_fallback_parity(monkeypatch):
+    """Blackwell-native PTX and the soft bit-op fallback must produce
     bit-identical packed bytes and dequantized values.
 
     Forcing `_supports_native_fp4` → False exercises the fallback on
@@ -404,3 +410,34 @@ def test_native_vs_lut_fallback_parity(monkeypatch):
     # Dequant values are bit-equal modulo signed-zero: -0.0 and 0.0
     # compare equal under arithmetic `==` but differ under `torch.equal`.
     assert ((deq_n - deq_l) == 0).all()
+
+
+@CUDA
+def test_fp8_e4m3_bit_synth_matches_torch_cast():
+    """All 256 fp8_e4m3fn encodings: bit-synth fp32 must match torch cast."""
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _decode_all(in_ptr, out_ptr, n):
+        pid = tl.program_id(0)
+        offs = pid * 256 + tl.arange(0, 256)
+        mask = offs < n
+        bits = tl.load(in_ptr + offs, mask=mask)
+        vals = _fp8_e4m3_bits_to_fp32(bits)
+        tl.store(out_ptr + offs, vals, mask=mask)
+
+    all_bits = torch.arange(256, dtype=torch.uint8, device="cuda")
+    out = torch.empty(256, dtype=torch.float32, device="cuda")
+    _decode_all[(1,)](all_bits, out, 256)
+
+    ref = all_bits.view(torch.float8_e4m3fn).to(torch.float32)
+    # NaN encodings (0x7F, 0xFF): both are NaN but bit patterns may differ;
+    # compare via isnan. Everything else must be bit-identical.
+    is_nan_ref = torch.isnan(ref)
+    is_nan_got = torch.isnan(out)
+    assert torch.equal(is_nan_ref, is_nan_got)
+    finite = ~is_nan_ref
+    assert torch.equal(
+        out[finite].view(torch.int32), ref[finite].view(torch.int32)
+    ), f"bit mismatch at indices {(out[finite] != ref[finite]).nonzero().flatten()}"

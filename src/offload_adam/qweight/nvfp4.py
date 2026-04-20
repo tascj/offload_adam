@@ -182,7 +182,7 @@ _TL_DTYPE_MAP = {
 
 
 def _supports_native_fp4() -> bool:
-    """Blackwell (sm_100+) has ``cvt.{f16x2,e2m1x2}``; else LUT fallback."""
+    """Blackwell (sm_100+) has ``cvt.{f16x2,e2m1x2}``; else soft (bit-op) fallback."""
     if not torch.cuda.is_available():
         return False
     try:
@@ -190,6 +190,30 @@ def _supports_native_fp4() -> bool:
     except Exception:
         return False
     return major >= 10
+
+
+@triton.jit
+def _fp8_e4m3_bits_to_fp32(bits_u8):
+    """FP8 E4M3FN (no inf, NaN=0x7F/0xFF) → fp32 via uint8 bit synthesis.
+
+    Layout: s | e e e e | m m m, exp bias 7. Used on pre-Ada where
+    Triton's ``tl.float8e4nv`` is not a valid target dtype.
+    """
+    bits = bits_u8.to(tl.int32)
+    sign = (bits & 0x80) << 24
+    exp = (bits >> 3) & 0xF
+    mant = bits & 0x7
+    is_zero_or_subnormal = exp == 0
+    is_nan = (exp == 0xF) & (mant == 0x7)
+    # Normal: fp32_exp = exp + 120 (= exp - 7 + 127), fp32_mant = mant << 20.
+    normal_bits = ((exp + 120) << 23) | (mant << 20)
+    # Subnormal: value = mant * 2^-9; mant=0 yields +0.
+    subnormal_bits = (mant.to(tl.float32) * (1.0 / 512.0)).to(tl.int32, bitcast=True)
+    abs_bits = tl.where(
+        is_nan, 0x7FC00000,
+        tl.where(is_zero_or_subnormal, subnormal_bits, normal_bits),
+    )
+    return (abs_bits | sign).to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -216,9 +240,9 @@ def _fp4_code_to_fp32(idx):
 
 
 @triton.jit
-def _dequant_nvfp4_kernel_lut(
+def _dequant_nvfp4_kernel_soft(
     packed_ptr,           # (out_f, in_f // 2) uint8
-    block_scale_fp8_ptr,  # (out_f, n_groups) fp8_e4m3
+    block_scale_u8_ptr,   # (out_f, n_groups) uint8 view of fp8_e4m3fn
     global_scale_ptr,     # () fp32 scalar
     out_ptr,              # (out_f, in_f) out.dtype
     packed_stride_row, packed_stride_col,
@@ -229,7 +253,7 @@ def _dequant_nvfp4_kernel_lut(
     BLOCK_M: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
 ):
-    """Software dequant: bit-synthesize fp32 from FP4 code, LUT-free. Pre-Blackwell fallback."""
+    """Software dequant: bit-synth FP4 + FP8 scale. Works on all sm_80+."""
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
 
@@ -254,15 +278,16 @@ def _dequant_nvfp4_kernel_lut(
     low_val = _fp4_code_to_fp32(low_idx)
     high_val = _fp4_code_to_fp32(high_idx)
 
-    # Reconstruct effective fp32 scale for this block.
-    block_scale_fp8 = tl.load(
-        block_scale_fp8_ptr
+    # Reconstruct effective fp32 scale for this block via bit synthesis.
+    scale_u8 = tl.load(
+        block_scale_u8_ptr
         + rows * scale_stride_row
         + pid_g * scale_stride_col,
         mask=row_mask,
-    )                                                       # (BLOCK_M,) fp8
+    )                                                       # (BLOCK_M,) uint8
+    scale_fp32 = _fp8_e4m3_bits_to_fp32(scale_u8)
     global_scale = tl.load(global_scale_ptr)                # scalar fp32
-    effective = block_scale_fp8.to(tl.float32) * global_scale
+    effective = scale_fp32 * global_scale
 
     low_val = low_val * effective[:, None]
     high_val = high_val * effective[:, None]
@@ -382,10 +407,11 @@ def _dequant_nvfp4_triton(
             OUT_DTYPE=_TL_DTYPE_MAP[out_dtype],
         )
     else:
-        _dequant_nvfp4_kernel_lut[grid](
-            packed, block_scale_fp8, global_scale, out,
+        scale_u8 = block_scale_fp8.view(torch.uint8)
+        _dequant_nvfp4_kernel_soft[grid](
+            packed, scale_u8, global_scale, out,
             packed.stride(0), packed.stride(1),
-            block_scale_fp8.stride(0), block_scale_fp8.stride(1),
+            scale_u8.stride(0), scale_u8.stride(1),
             out.stride(0), out.stride(1),
             out_f, n_groups,
             BLOCKSIZE=NVFP4_BLOCKSIZE,
@@ -406,7 +432,7 @@ def _quantize_nvfp4_prologue(
     BLOCK_M: tl.constexpr,
     pid_m, pid_g,
 ):
-    """Shared prologue: load tile, store per-block fp8 scale, return normalized fp32 tile."""
+    """Native-path prologue: load tile, write per-block fp8 scale, return normalized fp32 tile."""
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = rows < n_out_rows
     cols = pid_g * BLOCKSIZE + tl.arange(0, BLOCKSIZE)
@@ -490,8 +516,8 @@ def _quantize_nvfp4_kernel_native(
 
 
 @triton.jit
-def _quantize_nvfp4_kernel_lut(
-    input_ptr, packed_ptr, block_scale_fp8_ptr, global_scale_ptr,
+def _quantize_nvfp4_kernel_soft(
+    input_ptr, packed_ptr, block_scale_u8_ptr, global_scale_ptr,
     input_stride_row, input_stride_col,
     packed_stride_row, packed_stride_col,
     scale_stride_row, scale_stride_col,
@@ -500,15 +526,37 @@ def _quantize_nvfp4_kernel_lut(
     BLOCKSIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
-    """Software quant: threshold RNE + IEEE signbit, bit-matches the native path."""
+    """Software quant: pack only — block_scale_fp8 is pre-computed on host.
+
+    Bit-synthesizes fp32 from the uint8 view of fp8_e4m3fn so the kernel
+    compiles on pre-Ada (no ``tl.float8e4nv``).
+    """
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
-    normalized, row_mask = _quantize_nvfp4_prologue(
-        input_ptr, block_scale_fp8_ptr, global_scale_ptr,
-        input_stride_row, input_stride_col,
-        scale_stride_row, scale_stride_col,
-        n_out_rows, EPS, BLOCKSIZE, BLOCK_M, pid_m, pid_g,
+
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = rows < n_out_rows
+    cols = pid_g * BLOCKSIZE + tl.arange(0, BLOCKSIZE)
+
+    tile = tl.load(
+        input_ptr
+        + rows[:, None] * input_stride_row
+        + cols[None, :] * input_stride_col,
+        mask=row_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    scale_u8 = tl.load(
+        block_scale_u8_ptr
+        + rows * scale_stride_row
+        + pid_g * scale_stride_col,
+        mask=row_mask,
     )
+    scale_fp32 = _fp8_e4m3_bits_to_fp32(scale_u8)
+    global_scale = tl.load(global_scale_ptr)
+    effective = scale_fp32 * global_scale
+    inv_eff = tl.extra.libdevice.rcp_rn(tl.maximum(effective, EPS))
+    normalized = tile * inv_eff[:, None]
 
     # Positive-code selection on abs(x) via RNE midpoint thresholds.
     # `<=` at a boundary means the lower neighbour is the even-mantissa
@@ -580,11 +628,20 @@ def _quantize_nvfp4_triton(
             BLOCK_M=BLOCK_M,
         )
     else:
-        _quantize_nvfp4_kernel_lut[grid](
-            tensor, packed, block_scale_fp8, global_scale,
+        # Pre-compute block_scale_fp8 on host via torch — moves the fp32→fp8
+        # cast out of Triton so the kernel compiles on pre-Ada (no fp8e4nv).
+        t_b = tensor.reshape(out_f, n_groups, NVFP4_BLOCKSIZE).float()
+        block_amax = t_b.abs().amax(dim=-1).clamp(min=eps)
+        inv_global = 1.0 / global_scale
+        block_scale_fp8.copy_(
+            ((block_amax / FP4_E2M1_MAX) * inv_global).to(torch.float8_e4m3fn)
+        )
+        scale_u8 = block_scale_fp8.view(torch.uint8)
+        _quantize_nvfp4_kernel_soft[grid](
+            tensor, packed, scale_u8, global_scale,
             tensor.stride(0), tensor.stride(1),
             packed.stride(0), packed.stride(1),
-            block_scale_fp8.stride(0), block_scale_fp8.stride(1),
+            scale_u8.stride(0), scale_u8.stride(1),
             out_f, n_groups,
             EPS=eps,
             BLOCKSIZE=NVFP4_BLOCKSIZE,
