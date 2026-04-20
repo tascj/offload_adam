@@ -68,7 +68,9 @@ class Adam(Optimizer):
         self.decoupled_weight_decay = decoupled_weight_decay
 
         quant_count = sum(
-            1 for g in self.param_groups for p in g["params"]
+            1
+            for g in self.param_groups
+            for p in g["params"]
             if isinstance(p.data, QWeightBase)
         )
         if quant_count > 0 and mode != "fp32_master":
@@ -207,9 +209,7 @@ class Adam(Optimizer):
                 "load_master_state_dict requires mode='fp32_master'; "
                 f"current mode is {self.mode!r}."
             )
-        name2param = {
-            n: p for n, p in model.named_parameters() if p.requires_grad
-        }
+        name2param = {n: p for n, p in model.named_parameters() if p.requires_grad}
         unexpected = []
         for name, tensor in state_dict.items():
             p = name2param.get(name)
@@ -218,7 +218,7 @@ class Adam(Optimizer):
                 continue
             state = self.state[p]
             self._init_state_if_empty(p, state)
-            state["master_params"].copy_(tensor)
+            self._copy_master(p, tensor)
             if "master_filled" in state:
                 state["master_filled"] = True
         if strict and unexpected:
@@ -228,9 +228,17 @@ class Adam(Optimizer):
             )
         return (unexpected,)
 
+    def _copy_master(self, p, tensor):
+        """Copy a full-shape source tensor into ``p``'s master buffer."""
+        self.state[p]["master_params"].copy_(tensor)
+
     @torch.no_grad()
     def load_master_from_pretrained(
-        self, pretrained_name_or_path, model, *, strict=False,
+        self,
+        pretrained_name_or_path,
+        model,
+        *,
+        strict=False,
     ):
         """Refill the fp32 master from a ``from_pretrained``-style
         checkpoint (single file, sharded directory, or HF Hub repo ID).
@@ -263,7 +271,10 @@ class Adam(Optimizer):
                 f"current mode is {self.mode!r}."
             )
         return stream_master_from_pretrained(
-            self, pretrained_name_or_path, model, strict=strict,
+            self,
+            pretrained_name_or_path,
+            model,
+            strict=strict,
         )
 
     @torch.no_grad()

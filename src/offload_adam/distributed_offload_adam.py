@@ -36,7 +36,10 @@ from .pinned_alloc import zeros_pinned
 
 
 class DistributedOffloadAdam(OffloadAdam):
-    """Sharded-state variant of :class:`OffloadAdam`. See module docstring."""
+    """**Experimental.** Sharded-state variant of :class:`OffloadAdam`
+    (ZeRO-1 style). See module docstring for the design. Tested on a
+    narrow set of topologies; expect rough edges outside the validated
+    configurations."""
 
     def __init__(self, model, *, process_group=None, **kwargs):
         if not dist.is_available() or not dist.is_initialized():
@@ -100,6 +103,23 @@ class DistributedOffloadAdam(OffloadAdam):
                 group=self._pg,
             )
 
+    def _is_sharded_shape(self, p):
+        """Whether ``p`` will be dim-0 sharded across ranks."""
+        return self._world_size > 1 and p.shape[0] % self._world_size == 0
+
+    def _estimate_pinned_bytes(self, params):
+        """Grad is full-shape per rank; non-grad state is 1/world_size
+        when sharded, else full."""
+        need = 0
+        for p in params:
+            sharded = self._is_sharded_shape(p)
+            for name, dtype in self.offload_config.items():
+                elem_bytes = p.numel() * torch.empty(0, dtype=dtype).element_size()
+                if sharded and name != "grad":
+                    elem_bytes //= self._world_size
+                need += elem_bytes
+        return need
+
     def _alloc_pinned_states(self, params, numa_node):
         """Grad stays full-shape per rank; non-grad state is dim-0 sharded
         when ``p.shape[0] % world_size == 0``, else replicated."""
@@ -107,7 +127,7 @@ class DistributedOffloadAdam(OffloadAdam):
         for p in params:
             state = self.state[p]
             is_quant = p in self._quant_params
-            sharded = self._world_size > 1 and p.shape[0] % self._world_size == 0
+            sharded = self._is_sharded_shape(p)
             ds = p.shape[0] // self._world_size if sharded else None
             shard_shape = (ds, *p.shape[1:]) if sharded else p.shape
             if sharded:
@@ -285,35 +305,10 @@ class DistributedOffloadAdam(OffloadAdam):
                     self._step_offload(p, group, clip_coef=clip_coef)
                     state["host_grad_valid"] = False
 
-    @torch.no_grad()
-    def load_master_state_dict(self, state_dict, model, strict=False):
-        """Shard-aware: copy the local dim-0 slice of the source tensor
-        into sharded master, full-shape copy otherwise."""
-        if "master_params" not in self.offload_config:
-            raise RuntimeError(
-                "load_master_state_dict requires a mode that maintains "
-                f"master_params; current mode is {self.mode!r}."
-            )
-        name2param = {n: p for n, p in model.named_parameters() if p.requires_grad}
-        unexpected = []
-        for name, tensor in state_dict.items():
-            p = name2param.get(name)
-            if p is None or p not in self.state:
-                unexpected.append(name)
-                continue
-            state = self.state[p]
-            if p in self._sharded:
-                ds = p.shape[0] // self._world_size
-                state["master_params"].copy_(
-                    tensor[self._rank * ds : (self._rank + 1) * ds]
-                )
-            else:
-                state["master_params"].copy_(tensor)
-            if "master_filled" in state:
-                state["master_filled"] = True
-        if strict and unexpected:
-            raise ValueError(
-                "load_master_state_dict(strict=True): no param matches "
-                f"{len(unexpected)} key(s): {unexpected}"
-            )
-        return (unexpected,)
+    def _copy_master(self, p, tensor):
+        """Shard-aware: slice the source tensor to this rank's portion for
+        sharded params, otherwise full-shape copy."""
+        if p in self._sharded:
+            ds = p.shape[0] // self._world_size
+            tensor = tensor[self._rank * ds : (self._rank + 1) * ds]
+        self.state[p]["master_params"].copy_(tensor)

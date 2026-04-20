@@ -17,7 +17,11 @@ from .qweight.base import QWeightBase
 
 @torch.no_grad()
 def stream_master_from_pretrained(
-    optim, pretrained_name_or_path, model, *, strict: bool,
+    optim,
+    pretrained_name_or_path,
+    model,
+    *,
+    strict: bool,
 ) -> List[str]:
     """Stream lossless fp32 master tensors into ``optim.state`` for every
     param whose ``.data`` is a ``QWeightBase`` subclass. Peak memory per
@@ -26,14 +30,9 @@ def stream_master_from_pretrained(
     from safetensors import safe_open
 
     paths = resolve_safetensors_paths(pretrained_name_or_path)
-    name2param = {
-        n: p for n, p in model.named_parameters() if p.requires_grad
-    }
+    name2param = {n: p for n, p in model.named_parameters() if p.requires_grad}
     # Non-quant params already got a lossless widen at optimizer init.
-    quant_names = {
-        n for n, p in name2param.items()
-        if isinstance(p.data, QWeightBase)
-    }
+    quant_names = {n for n, p in name2param.items() if isinstance(p.data, QWeightBase)}
     # Adam inits state lazily; OffloadAdam eagerly. Route through the
     # initializer if it exists.
     init_state = getattr(optim, "_init_state_if_empty", None)
@@ -49,7 +48,7 @@ def stream_master_from_pretrained(
                 if "master_params" not in state:
                     continue
                 tensor = f.get_tensor(key)
-                state["master_params"].copy_(tensor)
+                optim._copy_master(p, tensor)
                 if "master_filled" in state:
                     state["master_filled"] = True
                 matched.add(key)

@@ -21,7 +21,7 @@ from .kernels import (
     adam_step_fp32_master_custom_rounding,
     adam_step_stochastic_rounding,
 )
-from .pinned_alloc import zeros_pinned
+from .pinned_alloc import numa_node_free_bytes, resolve_numa_target, zeros_pinned
 from .qweight.base import QWeightBase
 
 
@@ -222,6 +222,7 @@ class OffloadAdam(Optimizer):
                 if p.requires_grad and p not in self._inplace_params:
                     self._prefetch_module.setdefault(p, m)
         self._register_hooks(modules, params)
+        self._numa_precheck(self._offload_params, numa_node)
         self._alloc_pinned_states(self._offload_params, numa_node)
         self._alloc_inplace_states(self._inplace_params)
 
@@ -249,6 +250,52 @@ class OffloadAdam(Optimizer):
                 p.register_post_accumulate_grad_hook(self._grad_hook)
                 self.device_states[p] = {}
                 state["host_grad_valid"] = False
+
+    def _estimate_pinned_bytes(self, params):
+        """Total pinned bytes this rank will allocate for ``params``.
+        Subclasses that shard state across ranks should override.
+        """
+        return sum(
+            p.numel() * torch.empty(0, dtype=dtype).element_size()
+            for p in params
+            for dtype in self.offload_config.values()
+        )
+
+    def _numa_precheck(self, params, numa_node):
+        """Warn if the target NUMA node can't hold this rank's pinned budget.
+
+        Reads per-node MemFree and divides by world_size (assumes worst case:
+        every rank binds to the same node — true for single-socket hosts
+        where all GPUs share one NUMA domain). When need > fair share,
+        ``MPOL_PREFERRED`` (see ``pinned_alloc``) will spill the overflow to
+        remote nodes at ~10-15% H2D cost.
+        """
+        target = resolve_numa_target(numa_node)
+        if target is None or not params:
+            return
+        free = numa_node_free_bytes(target)
+        if free is None:
+            return
+        need = self._estimate_pinned_bytes(params)
+        world_size = getattr(self, "_world_size", 1)
+        fair_share = free // world_size
+        if need > fair_share:
+            spill = need - fair_share
+            gib = 1024**3
+            warnings.warn(
+                f"OffloadAdam: need {need / gib:.1f} GB pinned on NUMA node "
+                f"{target} ({world_size} rank(s) sharing) but fair share is "
+                f"{fair_share / gib:.1f} GB; ~{spill / gib:.1f} GB will "
+                f"spill to remote nodes (H2D may slow ~10-15%). Pass "
+                f"`numa_node=None` to let the kernel spread freely, or move "
+                f"GPUs to separate NUMA domains.",
+                stacklevel=3,
+            )
+
+    def _copy_master(self, p, tensor):
+        """Copy a full-shape source tensor into ``p``'s master buffer.
+        Subclasses that shard master state should override to slice first."""
+        self.state[p]["master_params"].copy_(tensor)
 
     def _alloc_pinned_states(self, params, numa_node):
         total_bytes = 0
@@ -564,7 +611,7 @@ class OffloadAdam(Optimizer):
                 unexpected.append(name)
                 continue
             state = self.state[p]
-            state["master_params"].copy_(tensor)
+            self._copy_master(p, tensor)
             # Loaded → mark filled so the step-time warning skips this
             # param. Persisted via `Optimizer.state_dict()`.
             if "master_filled" in state:

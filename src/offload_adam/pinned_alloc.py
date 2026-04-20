@@ -4,6 +4,12 @@ Each call does mmap + cudaHostRegister, optionally mbind to the NUMA node
 of the current CUDA device. This avoids PyTorch's power-of-2 rounding in
 its pinned allocator and the cross-socket DMA penalty in multi-GPU runs.
 
+NUMA binding uses ``MPOL_PREFERRED`` (soft preference): pages land on the
+target node while it has room, otherwise the kernel spills to other nodes.
+This costs ~10-15% H2D bandwidth on remote pages but avoids the hard OOM
+that ``MPOL_BIND`` triggers when the target node exhausts. Use
+``numa_node_free_bytes`` to pre-check before alloc.
+
 Linux-only. libnuma.so.1 is optional; without it, NUMA binding is skipped.
 """
 
@@ -20,8 +26,7 @@ _MAP_ANONYMOUS = 0x20
 _PROT_READ = 0x1
 _PROT_WRITE = 0x2
 _MAP_FAILED = ctypes.c_void_p(-1).value
-_MPOL_BIND = 2
-_MPOL_MF_STRICT = 1 << 0
+_MPOL_PREFERRED = 1
 _MPOL_MF_MOVE = 1 << 1
 # nodemask lives in one c_ulong (64 bits); enough for 64 NUMA nodes.
 _MAX_NUMA_NODES = ctypes.sizeof(ctypes.c_ulong) * 8
@@ -123,6 +128,52 @@ def gpu_numa_node(device=None) -> int:
         return -1
 
 
+def resolve_numa_target(numa_node) -> int | None:
+    """Resolve a user-facing ``numa_node`` value into a concrete node id.
+
+    Accepts:
+      * ``"auto"`` — returns the current CUDA device's NUMA node if known,
+        else None (no binding).
+      * ``int``   — returns the int; raises if libnuma is unavailable.
+      * ``None``  — returns None (no binding).
+    """
+    if numa_node == "auto":
+        if torch.cuda.is_available() and _libnuma() is not None:
+            detected = gpu_numa_node()
+            if detected >= 0:
+                return detected
+        return None
+    if isinstance(numa_node, int):
+        if _libnuma() is None:
+            raise RuntimeError(
+                "libnuma.so.1 not available; install libnuma1 or pass numa_node=None"
+            )
+        return numa_node
+    if numa_node is None:
+        return None
+    raise ValueError(f"numa_node must be 'auto', an int, or None (got {numa_node!r})")
+
+
+def numa_node_free_bytes(node: int) -> int | None:
+    """Return ``MemFree`` in bytes for the given NUMA node, or None on failure.
+
+    Reads /sys/devices/system/node/nodeN/meminfo. Callers use this to
+    pre-check whether a planned pinned allocation fits the target node
+    before committing; when the allocation exceeds free, ``MPOL_PREFERRED``
+    spills the overflow to remote nodes (see module docstring).
+    """
+    try:
+        text = Path(f"/sys/devices/system/node/node{node}/meminfo").read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if "MemFree:" in line:
+            parts = line.split()
+            # "Node 1 MemFree:   64457228 kB"
+            return int(parts[-2]) * 1024
+    return None
+
+
 def _alloc(size, numa_target):
     """mmap + optional mbind + first-touch + cudaHostRegister."""
     libc = _libc()
@@ -142,20 +193,21 @@ def _alloc(size, numa_target):
         numa = _libnuma()
         assert numa is not None
         nodemask = (ctypes.c_ulong * 1)(1 << numa_target)
+        # MPOL_PREFERRED: soft preference — pages go to numa_target while it
+        # has room, otherwise kernel falls back to other nodes. STRICT is
+        # incompatible with PREFERRED (it implies hard enforcement).
         ret = numa.mbind(
             ptr,
             size,
-            _MPOL_BIND,
+            _MPOL_PREFERRED,
             nodemask,
             _MAX_NUMA_NODES,
-            _MPOL_MF_STRICT | _MPOL_MF_MOVE,
+            _MPOL_MF_MOVE,
         )
         if ret != 0:
             err = ctypes.get_errno()
             libc.munmap(ptr, size)
-            raise OSError(
-                err, f"mbind(node={numa_target}) failed: {os.strerror(err)}"
-            )
+            raise OSError(err, f"mbind(node={numa_target}) failed: {os.strerror(err)}")
 
     # First-touch: commit physical pages now so the mbind policy applies,
     # rather than letting them fault in lazily during later access.
@@ -211,23 +263,7 @@ def zeros_pinned(shape, dtype, numa_node="auto"):
     if size == 0:
         size = _PAGE_SIZE
 
-    target = None
-    if numa_node == "auto":
-        if torch.cuda.is_available() and _libnuma() is not None:
-            detected = gpu_numa_node()
-            if detected >= 0:
-                target = detected
-    elif isinstance(numa_node, int):
-        if _libnuma() is None:
-            raise RuntimeError(
-                "libnuma.so.1 not available; install libnuma1 or pass "
-                "numa_node=None"
-            )
-        target = numa_node
-    elif numa_node is not None:
-        raise ValueError(
-            f"numa_node must be 'auto', an int, or None (got {numa_node!r})"
-        )
+    target = resolve_numa_target(numa_node)
 
     ptr, cleanup = _alloc(size, target)
     try:
