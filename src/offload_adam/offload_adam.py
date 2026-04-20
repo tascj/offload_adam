@@ -130,8 +130,7 @@ class OffloadAdam(Optimizer):
     ):
         if prefetch_policy not in ("eager", "lazy"):
             raise ValueError(
-                f"prefetch_policy must be 'eager' or 'lazy' (got "
-                f"{prefetch_policy!r})"
+                f"prefetch_policy must be 'eager' or 'lazy' (got {prefetch_policy!r})"
             )
         self._prefetch_policy = prefetch_policy
         assert mode in self.supported_modes, (
@@ -183,9 +182,7 @@ class OffloadAdam(Optimizer):
         super().__init__(params, defaults)
 
         # Quant params: fp32 master + re-quant via dispatch.
-        self._quant_params = {
-            p for p in params if isinstance(p.data, QWeightBase)
-        }
+        self._quant_params = {p for p in params if isinstance(p.data, QWeightBase)}
         if self._quant_params and mode != "fp32_master":
             raise ValueError(
                 f"QAT params require mode='fp32_master'; got {mode!r} "
@@ -201,13 +198,11 @@ class OffloadAdam(Optimizer):
             inplace_param_threshold = self._DEFAULT_INPLACE_PARAM_THRESHOLD
         self.inplace_param_threshold = inplace_param_threshold
         self._inplace_params = {
-            p for p in params
-            if p.numel() < inplace_param_threshold
-            and p not in self._quant_params
+            p
+            for p in params
+            if p.numel() < inplace_param_threshold and p not in self._quant_params
         }
-        self._offload_params = [
-            p for p in params if p not in self._inplace_params
-        ]
+        self._offload_params = [p for p in params if p not in self._inplace_params]
 
         self.device_states = {}
         self.h2d_events = {}
@@ -264,16 +259,15 @@ class OffloadAdam(Optimizer):
                 t = zeros_pinned(p.shape, dtype, numa_node=numa_node)
                 if name == "master_params":
                     # Quant: `copy_` dequantizes — lossy seed. Plain: lossless widen.
-                    # `master_filled=False` below flags lossy for load_master_from_pretrained.
+                    # `master_filled=False` below flags the lossy case for
+                    # `load_master_from_pretrained`.
                     t.copy_(p.data)
                 state[name] = t
                 total_bytes += t.numel() * t.element_size()
             if is_quant and "master_params" in self.offload_config:
                 state["master_filled"] = False
         if self.verbose > 0 and params:
-            print(
-                f"Pinned host memory allocated: {total_bytes / (1024 ** 3):.2f} GB"
-            )
+            print(f"Pinned host memory allocated: {total_bytes / (1024**3):.2f} GB")
 
     def _alloc_inplace_states(self, params):
         """Allocate optimizer states on GPU for params kept in-place.
@@ -293,7 +287,7 @@ class OffloadAdam(Optimizer):
         if self.verbose > 0 and params:
             print(
                 f"In-place GPU states for {len(params)} small params: "
-                f"{total_bytes / (1024 ** 2):.2f} MB"
+                f"{total_bytes / (1024**2):.2f} MB"
             )
 
     # ------------------------------------------------------------------
@@ -325,9 +319,7 @@ class OffloadAdam(Optimizer):
         self.d2h_stream.wait_stream(main_stream)
         for key in keys:
             with torch.cuda.stream(self.d2h_stream):
-                self._host_view(p, key).copy_(
-                    device_states[key], non_blocking=True
-                )
+                self._host_view(p, key).copy_(device_states[key], non_blocking=True)
             device_states[key].record_stream(self.d2h_stream)
             device_states[key] = None
         self.d2h_events[p] = self.d2h_stream.record_event()
@@ -362,26 +354,29 @@ class OffloadAdam(Optimizer):
             state["host_grad_valid"] = True
         p.grad = None
 
+    def _maybe_warn_quant_master(self, state):
+        """One-shot warning when a quant param is stepping with a lossy
+        dequant-seeded master. Subclasses that bypass ``_call_step_fn``
+        for some quant path should call this at their equivalent site."""
+        if self._quant_master_warned or state.get("master_filled") is not False:
+            return
+        warnings.warn(
+            "OffloadAdam: quantized params running with a lossy "
+            "dequant-seeded fp32 master. For higher precision, call "
+            "`optim.load_master_from_pretrained("
+            "pretrained_name_or_path, model)` with the same "
+            "bf16/fp16 checkpoint `from_pretrained` used before "
+            "`quantize_linears` ran.",
+            stacklevel=3,
+        )
+        self._quant_master_warned = True
+
     def _call_step_fn(self, p, group, device_states):
         state = self.state[p]
         beta1, beta2 = group["betas"]
         is_quant = p in self._quant_params
-        if (
-            is_quant
-            and not self._quant_master_warned
-            and state.get("master_filled") is False
-        ):
-            warnings.warn(
-                "OffloadAdam: quantized params running with a lossy "
-                "dequant-seeded fp32 master. For higher precision, call "
-                "`optim.load_master_from_pretrained("
-                "pretrained_name_or_path, model)` with the same "
-                "bf16/fp16 checkpoint `from_pretrained` used before "
-                "`quantize_linears` ran.",
-                stacklevel=2,
-            )
-            self._quant_master_warned = True  # warn once
         if is_quant:
+            self._maybe_warn_quant_master(state)
             # bf16 master write-back would smash packed storage; redirect
             # to grad (dummy sink) and re-quantize via `copy_` below.
             param_view = device_states["grad"]
@@ -421,9 +416,7 @@ class OffloadAdam(Optimizer):
         state = self.state[p]
         if clip_coef is not None:
             state["grad"].mul_(clip_coef)
-        self._call_step_fn(
-            p, group, {k: state[k] for k in self.offload_state_keys}
-        )
+        self._call_step_fn(p, group, {k: state[k] for k in self.offload_state_keys})
         state["grad"].zero_()
 
     # ------------------------------------------------------------------
@@ -446,9 +439,7 @@ class OffloadAdam(Optimizer):
             if self.state[p]["host_grad_valid"] and dev.get("grad") is None:
                 keys.append("grad")
             if self._step_in_backward and self.ready_for_optimizer_step:
-                keys.extend(
-                    k for k in self._non_grad_keys if dev.get(k) is None
-                )
+                keys.extend(k for k in self._non_grad_keys if dev.get(k) is None)
             if keys:
                 self._issue_h2d(p, keys)
 
@@ -464,9 +455,7 @@ class OffloadAdam(Optimizer):
         # Clipping path: record per-param L2 norm; .step() reduces it into
         # the global norm and applies the clip coefficient at step time.
         if self.max_grad_norm is not None and self.ready_for_optimizer_step:
-            state["grad_norm"] = torch.norm(
-                self.device_states[p]["grad"], 2.0
-            )
+            state["grad_norm"] = torch.norm(self.device_states[p]["grad"], 2.0)
 
         # Step-in-backward path: run the whole step here on the last mb;
         # every other case just writes the accumulated grad back to host.
@@ -522,9 +511,7 @@ class OffloadAdam(Optimizer):
                 for p in group["params"]
             ]
             total_norm = torch.linalg.vector_norm(torch.stack(norms), 2.0)
-            clip_coef = torch.clamp(
-                self.max_grad_norm / (total_norm + 1e-6), max=1.0
-            )
+            clip_coef = torch.clamp(self.max_grad_norm / (total_norm + 1e-6), max=1.0)
 
         for group in self.param_groups:
             for p in group["params"]:
@@ -569,9 +556,7 @@ class OffloadAdam(Optimizer):
                 "load_master_state_dict requires a mode that maintains "
                 f"master_params (e.g. 'fp32_master'); current mode is {self.mode!r}."
             )
-        name2param = {
-            n: p for n, p in model.named_parameters() if p.requires_grad
-        }
+        name2param = {n: p for n, p in model.named_parameters() if p.requires_grad}
         unexpected = []
         for name, tensor in state_dict.items():
             p = name2param.get(name)
@@ -593,7 +578,11 @@ class OffloadAdam(Optimizer):
 
     @torch.no_grad()
     def load_master_from_pretrained(
-        self, pretrained_name_or_path, model, *, strict=False,
+        self,
+        pretrained_name_or_path,
+        model,
+        *,
+        strict=False,
     ):
         """Refill the fp32 master from a ``from_pretrained``-style
         checkpoint (single file, sharded directory, or HF Hub repo ID).
@@ -627,7 +616,10 @@ class OffloadAdam(Optimizer):
                 f"mode is {self.mode!r}."
             )
         return stream_master_from_pretrained(
-            self, pretrained_name_or_path, model, strict=strict,
+            self,
+            pretrained_name_or_path,
+            model,
+            strict=strict,
         )
 
     def load_state_dict(self, state_dict):
