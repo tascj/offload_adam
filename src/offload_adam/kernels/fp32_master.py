@@ -44,7 +44,7 @@ def adam_step_fp32_master_kernel(
     exp_avg_sq = tl.load(exp_avg_sq_ptr + offsets, mask=mask).to(tl.float32)
 
     if DECOUPLED_WEIGHT_DECAY:
-        master_params = master_params - lr *weight_decay * master_params
+        master_params = master_params - lr * weight_decay * master_params
     else:
         grad = grad + weight_decay * master_params
     exp_avg = exp_avg + (1 - beta1_hat) * (grad - exp_avg)
@@ -92,4 +92,3 @@ def adam_step_fp32_master(
         BLOCK_SIZE,
     )
     torch.cuda.synchronize()
-

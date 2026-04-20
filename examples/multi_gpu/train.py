@@ -55,7 +55,9 @@ def parse_args():
         help="NUMA policy for pinned allocations: 'auto', an int node id, or 'none'.",
     )
     parser.add_argument(
-        "--prefetch-policy", choices=["eager", "lazy"], default="eager",
+        "--prefetch-policy",
+        choices=["eager", "lazy"],
+        default="eager",
     )
     parser.add_argument(
         "--gradient-checkpointing",
@@ -131,9 +133,11 @@ def build_optimizer(args, model):
 def synthetic_batch_iter(args, vocab_size, device):
     while True:
         input_ids = torch.randint(
-            0, vocab_size,
+            0,
+            vocab_size,
             (args.per_rank_batch_size, args.tokens_per_sample),
-            device=device, dtype=torch.long,
+            device=device,
+            dtype=torch.long,
         )
         yield {
             "input_ids": input_ids,
@@ -164,9 +168,7 @@ def run(args, model, optimizer, rank, world_size, device):
         last_loss = None
 
         for micro in range(args.grad_accum_steps):
-            optimizer.ready_for_optimizer_step = (
-                micro == args.grad_accum_steps - 1
-            )
+            optimizer.ready_for_optimizer_step = micro == args.grad_accum_steps - 1
             batch = next(data_iter)
             out = model(**batch)
             loss = out.loss / args.grad_accum_steps

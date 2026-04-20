@@ -46,8 +46,13 @@ def _register_qweight_hooks(module: nn.Module, weight_cls: Type[QWeightBase]) ->
             destination[prefix + suf] = t
 
     def load_pre_hook(
-        state_dict, prefix, local_metadata, strict,
-        missing_keys, unexpected_keys, error_msgs,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
     ):
         suffixes = weight_cls.canonical_key_suffixes()
         plain = {}
@@ -55,7 +60,8 @@ def _register_qweight_hooks(module: nn.Module, weight_cls: Type[QWeightBase]) ->
             key = prefix + suf
             if key in state_dict:
                 plain[suf] = state_dict.pop(key)
-        # Bare "weight" at non-uint8 dtype = plain checkpoint; let aten.copy_ re-quantize.
+        # Bare "weight" at non-uint8 dtype = plain checkpoint; let aten.copy_
+        # re-quantize.
         if "weight" in plain and plain["weight"].dtype is not torch.uint8:
             state_dict[prefix + "weight"] = plain.pop("weight")
         if not plain:
@@ -68,7 +74,8 @@ def _register_qweight_hooks(module: nn.Module, weight_cls: Type[QWeightBase]) ->
             module.weight.data if isinstance(module.weight.data, weight_cls) else None
         )
         state_dict[prefix + "weight"] = weight_cls.from_plain_state_dict(
-            plain, reference=reference,
+            plain,
+            reference=reference,
         )
 
     module._register_state_dict_hook(save_hook)
@@ -128,9 +135,7 @@ def quantize_linears(
             continue
         if not weight_cls.can_quantize(module.weight, **weight_kwargs):
             w = module.weight
-            incompatible.append(
-                (name, f"shape={tuple(w.shape)} dtype={w.dtype}")
-            )
+            incompatible.append((name, f"shape={tuple(w.shape)} dtype={w.dtype}"))
             continue
         w = module.weight
         src = w.data.to(device) if device is not None else w.data
@@ -146,10 +151,13 @@ def quantize_linears(
         )
     if update_hf_config and hasattr(model, "config"):
         model.config.quantization_config = weight_cls.build_hf_quantization_config(
-            skip_patterns=skip_patterns, **weight_kwargs,
+            skip_patterns=skip_patterns,
+            **weight_kwargs,
         )
     return QuantizeReport(
-        quantized=quantized, incompatible=incompatible, excluded=excluded,
+        quantized=quantized,
+        incompatible=incompatible,
+        excluded=excluded,
     )
 
 
@@ -173,6 +181,7 @@ def save_quantized_pretrained(
     cfg_path = save_dir / "config.json"
     cfg = json.loads(cfg_path.read_text())
     cfg["quantization_config"] = weight_cls.build_hf_quantization_config(
-        skip_patterns=skip_patterns, **weight_kwargs,
+        skip_patterns=skip_patterns,
+        **weight_kwargs,
     )
     cfg_path.write_text(json.dumps(cfg, indent=2))

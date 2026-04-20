@@ -25,9 +25,11 @@ aten = torch.ops.aten
 # Python reference: quantize / dequantize
 # ----------------------------------------------------------------------
 
+
 @torch.no_grad()
 def quantize_int8_per_channel(
-    tensor: Tensor, eps: float = 1e-12,
+    tensor: Tensor,
+    eps: float = 1e-12,
 ) -> Tuple[Tensor, Tensor]:
     """Reference python quantize, per-output-channel symmetric.
 
@@ -40,7 +42,7 @@ def quantize_int8_per_channel(
     assert tensor.ndim == 2
     orig_dtype = tensor.dtype
     t = tensor.float()
-    absmax = t.abs().amax(dim=1)                       # (out_f,) fp32
+    absmax = t.abs().amax(dim=1)  # (out_f,) fp32
     scale = absmax / 127.0
     inv_scale = 1.0 / scale.clamp(min=eps)
     q = (t * inv_scale.unsqueeze(1)).round().clamp(-128, 127).to(torch.int8)
@@ -48,7 +50,8 @@ def quantize_int8_per_channel(
 
 
 def dequantize_int8_per_channel(
-    weight: Tensor, scales: Tensor,
+    weight: Tensor,
+    scales: Tensor,
 ) -> Tensor:
     """Inverse of `quantize_int8_per_channel`. Computes at scales.dtype."""
     return weight.to(scales.dtype) * scales.unsqueeze(1)
@@ -58,18 +61,23 @@ def dequantize_int8_per_channel(
 # Triton kernels
 # ----------------------------------------------------------------------
 
+
 @triton.jit
 def _dequant_int8_kernel(
-    weight_ptr,      # (out_f, in_f) int8
-    scales_ptr,      # (out_f,) scales.dtype
-    out_ptr,         # (out_f, in_f) scales.dtype
-    weight_stride_row, weight_stride_col,
-    out_stride_row, out_stride_col,
-    n_out_rows, n_in_cols,
+    weight_ptr,  # (out_f, in_f) int8
+    scales_ptr,  # (out_f,) scales.dtype
+    out_ptr,  # (out_f, in_f) scales.dtype
+    weight_stride_row,
+    weight_stride_col,
+    out_stride_row,
+    out_stride_col,
+    n_out_rows,
+    n_in_cols,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Fused int8→float cast + per-row scale multiply, one (BLOCK_M, BLOCK_N) tile per program."""
+    """Fused int8→float cast + per-row scale multiply, one (BLOCK_M, BLOCK_N)
+    tile per program."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
@@ -103,10 +111,15 @@ def _dequant_int8_triton(weight: Tensor, scales: Tensor) -> Tensor:
     BLOCK_N = 128
     grid = (triton.cdiv(out_f, BLOCK_M), triton.cdiv(in_f, BLOCK_N))
     _dequant_int8_kernel[grid](
-        weight, scales, out,
-        weight.stride(0), weight.stride(1),
-        out.stride(0), out.stride(1),
-        out_f, in_f,
+        weight,
+        scales,
+        out,
+        weight.stride(0),
+        weight.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out_f,
+        in_f,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
     )
@@ -115,12 +128,15 @@ def _dequant_int8_triton(weight: Tensor, scales: Tensor) -> Tensor:
 
 @triton.jit
 def _quantize_int8_kernel(
-    input_ptr,       # (out_f, in_f) bf16 / fp16 / fp32
-    weight_ptr,      # (out_f, in_f) int8
-    scales_ptr,      # (out_f,) scales.dtype
-    input_stride_row, input_stride_col,
-    weight_stride_row, weight_stride_col,
-    n_out_rows, n_in_cols,
+    input_ptr,  # (out_f, in_f) bf16 / fp16 / fp32
+    weight_ptr,  # (out_f, in_f) int8
+    scales_ptr,  # (out_f,) scales.dtype
+    input_stride_row,
+    input_stride_col,
+    weight_stride_row,
+    weight_stride_col,
+    n_out_rows,
+    n_in_cols,
     EPS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -184,23 +200,31 @@ def _quantize_int8_kernel(
 
 
 def _quantize_int8_triton(
-    tensor: Tensor, scale_dtype: torch.dtype,
+    tensor: Tensor,
+    scale_dtype: torch.dtype,
 ) -> Tuple[Tensor, Tensor]:
     """Fused triton absmax + int8 quantize. Returns (weight, scales)."""
     assert tensor.ndim == 2
     out_f, in_f = tensor.shape
     weight = torch.empty(
-        (out_f, in_f), dtype=torch.int8, device=tensor.device,
+        (out_f, in_f),
+        dtype=torch.int8,
+        device=tensor.device,
     )
     scales = torch.empty((out_f,), dtype=scale_dtype, device=tensor.device)
     BLOCK_M = 32
     BLOCK_N = 128
     grid = (triton.cdiv(out_f, BLOCK_M),)
     _quantize_int8_kernel[grid](
-        tensor, weight, scales,
-        tensor.stride(0), tensor.stride(1),
-        weight.stride(0), weight.stride(1),
-        out_f, in_f,
+        tensor,
+        weight,
+        scales,
+        tensor.stride(0),
+        tensor.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        out_f,
+        in_f,
         EPS=1e-12,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
@@ -211,6 +235,7 @@ def _quantize_int8_triton(
 # ----------------------------------------------------------------------
 # Tensor subclass
 # ----------------------------------------------------------------------
+
 
 class Int8QWeight(QWeightBase):
     """Int8 per-channel symmetric QAT weight.
@@ -223,7 +248,10 @@ class Int8QWeight(QWeightBase):
     def __new__(cls, weight: Tensor, scales: Tensor):
         out_f, in_f = weight.shape
         return Tensor._make_wrapper_subclass(
-            cls, (out_f, in_f), dtype=scales.dtype, device=weight.device,
+            cls,
+            (out_f, in_f),
+            dtype=scales.dtype,
+            device=weight.device,
         )
 
     @torch._dynamo.disable
@@ -242,7 +270,8 @@ class Int8QWeight(QWeightBase):
 
     @classmethod
     def from_float(
-        cls, tensor: Tensor,
+        cls,
+        tensor: Tensor,
         scale_dtype: torch.dtype = torch.bfloat16,
         **_,
     ):
@@ -269,8 +298,7 @@ class Int8QWeight(QWeightBase):
         # fp32 upcast or cross-dtype: python fallback.
         compute_dtype = torch.float32 if dtype == torch.float32 else self.scales.dtype
         return (
-            self.weight.to(compute_dtype)
-            * self.scales.to(compute_dtype).unsqueeze(1)
+            self.weight.to(compute_dtype) * self.scales.to(compute_dtype).unsqueeze(1)
         ).to(dtype)
 
     @classmethod
@@ -286,27 +314,33 @@ class Int8QWeight(QWeightBase):
         # per int32 LSB-first. Matches compressed-tensors' `uint8b128` W8A16.
         u = ((self.weight.to(torch.int32) + 128) & 0xFF).reshape(out_f, in_f // 4, 4)
         shifts = torch.tensor(
-            [0, 8, 16, 24], dtype=torch.int32, device=u.device,
+            [0, 8, 16, 24],
+            dtype=torch.int32,
+            device=u.device,
         )
         weight_packed = (u << shifts).sum(dim=-1, dtype=torch.int32)
         return {
             "weight_packed": weight_packed,
-            "weight_scale": self.scales.unsqueeze(1),     # (out_f, 1)
+            "weight_scale": self.scales.unsqueeze(1),  # (out_f, 1)
             "weight_shape": torch.tensor(
-                [out_f, in_f], dtype=torch.int64, device=u.device,
+                [out_f, in_f],
+                dtype=torch.int64,
+                device=u.device,
             ),
         }
 
     @classmethod
     def from_plain_state_dict(cls, plain: dict, reference=None) -> "Int8QWeight":
         packed = plain["weight_packed"]
-        scale = plain["weight_scale"].squeeze(-1)         # (out_f, 1) → (out_f,)
+        scale = plain["weight_scale"].squeeze(-1)  # (out_f, 1) → (out_f,)
         out_f, half = packed.shape
         in_f = half * 4
         shifts = torch.tensor(
-            [0, 8, 16, 24], dtype=torch.int32, device=packed.device,
+            [0, 8, 16, 24],
+            dtype=torch.int32,
+            device=packed.device,
         )
-        u = (packed.unsqueeze(-1) >> shifts) & 0xFF       # uint8 [0, 255]
+        u = (packed.unsqueeze(-1) >> shifts) & 0xFF  # uint8 [0, 255]
         weight = (u.reshape(out_f, in_f) - 128).to(torch.int8)  # undo zero-point 128
         return cls(weight, scale)
 
@@ -340,6 +374,7 @@ class Int8QWeight(QWeightBase):
 # Autograd: F.linear through the dequantize path
 # ----------------------------------------------------------------------
 
+
 class _Int8WeightOnlyLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: Tensor, weight: Int8QWeight, bias: Optional[Tensor] = None):
@@ -365,6 +400,7 @@ class _Int8WeightOnlyLinear(torch.autograd.Function):
 # ----------------------------------------------------------------------
 # Dispatch
 # ----------------------------------------------------------------------
+
 
 @Int8QWeight.implements_torch_function(torch.nn.functional.linear)
 def _(func, types, args, kwargs):

@@ -203,7 +203,8 @@ def maybe_quantize(args, model):
     elif args.quant == "nf4":
         kwargs["blocksize"] = args.quant_blocksize
     report = quantize_linears(
-        model, weight_cls,
+        model,
+        weight_cls,
         skip_patterns=tuple(args.quant_skip_patterns),
         **kwargs,
     )
@@ -216,7 +217,8 @@ def maybe_quantize(args, model):
     )
     if report.incompatible:
         print(
-            f"  incompatible layers: {report.incompatible}", flush=True,
+            f"  incompatible layers: {report.incompatible}",
+            flush=True,
         )
 
 
@@ -249,9 +251,11 @@ def build_optimizer(args, model):
 def synthetic_batch_iter(args, vocab_size):
     while True:
         input_ids = torch.randint(
-            0, vocab_size,
+            0,
+            vocab_size,
             (args.batch_size, args.tokens_per_sample),
-            device="cuda", dtype=torch.long,
+            device="cuda",
+            dtype=torch.long,
         )
         yield {
             "input_ids": input_ids,
@@ -263,9 +267,7 @@ def synthetic_batch_iter(args, vocab_size):
 def run(args, model, optimizer):
     vocab_size = model.config.vocab_size
     data_iter = synthetic_batch_iter(args, vocab_size)
-    tokens_per_step = (
-        args.batch_size * args.tokens_per_sample * args.grad_accum_steps
-    )
+    tokens_per_step = args.batch_size * args.tokens_per_sample * args.grad_accum_steps
 
     step_times = []
     step_losses = []
@@ -279,9 +281,7 @@ def run(args, model, optimizer):
 
         for micro in range(args.grad_accum_steps):
             if hasattr(optimizer, "ready_for_optimizer_step"):
-                optimizer.ready_for_optimizer_step = (
-                    micro == args.grad_accum_steps - 1
-                )
+                optimizer.ready_for_optimizer_step = micro == args.grad_accum_steps - 1
             batch = next(data_iter)
             out = model(**batch)
             loss = out.loss / args.grad_accum_steps
@@ -343,11 +343,12 @@ def main():
     optimizer = build_optimizer(args, model)
     if args.quant != "none" and args.load_master_from is not None:
         missing = optimizer.load_master_from_pretrained(
-            args.load_master_from, model, strict=False,
+            args.load_master_from,
+            model,
+            strict=False,
         )
         refilled = sum(
-            1 for s in optimizer.state.values()
-            if s.get("master_filled") is True
+            1 for s in optimizer.state.values() if s.get("master_filled") is True
         )
         print(
             f"load_master_from={args.load_master_from} "

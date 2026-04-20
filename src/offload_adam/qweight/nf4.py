@@ -33,10 +33,22 @@ aten = torch.ops.aten
 
 # The 16-entry NF4 lookup table (bitsandbytes canonical values).
 NF4_LUT = (
-    -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-    -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
-    0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
-    0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0,
+    -1.0,
+    -0.6961928009986877,
+    -0.5250730514526367,
+    -0.39491748809814453,
+    -0.28444138169288635,
+    -0.18477343022823334,
+    -0.09105003625154495,
+    0.0,
+    0.07958029955625534,
+    0.16093020141124725,
+    0.24611230194568634,
+    0.33791524171829224,
+    0.44070982933044434,
+    0.5626170039176941,
+    0.7229568362236023,
+    1.0,
 )
 
 
@@ -58,6 +70,7 @@ def _nf4_lut(device: torch.device, dtype: torch.dtype = torch.float32) -> Tensor
 # Python reference: pack / unpack / quantize
 # ----------------------------------------------------------------------
 
+
 def pack_nf4(indices: Tensor) -> Tensor:
     """(out_f, in_f) uint8 indices (0..15) → (out_f, in_f // 2) uint8.
 
@@ -77,7 +90,9 @@ def unpack_nf4(packed: Tensor) -> Tensor:
     low = packed & 0xF
     out_f, half_in_f = packed.shape
     result = torch.empty(
-        (out_f, 2 * half_in_f), dtype=torch.uint8, device=packed.device,
+        (out_f, 2 * half_in_f),
+        dtype=torch.uint8,
+        device=packed.device,
     )
     result[:, 0::2] = high
     result[:, 1::2] = low
@@ -86,7 +101,8 @@ def unpack_nf4(packed: Tensor) -> Tensor:
 
 @torch.no_grad()
 def quantize_nf4_blockwise(
-    tensor: Tensor, blocksize: int = 64,
+    tensor: Tensor,
+    blocksize: int = 64,
 ) -> Tuple[Tensor, Tensor]:
     """Reference python NF4 quantize.
 
@@ -104,13 +120,13 @@ def quantize_nf4_blockwise(
     n_groups = in_f // blocksize
 
     t = tensor.float().reshape(out_f, n_groups, blocksize)
-    absmax = t.abs().amax(dim=-1)                          # (out_f, n_groups) fp32
+    absmax = t.abs().amax(dim=-1)  # (out_f, n_groups) fp32
     # Use `t * (1/absmax)` instead of `t / absmax` to match the triton
     # kernel's recip-then-multiply path bit-for-bit.
     inv_absmax = 1.0 / absmax.clamp(min=1e-12)
     normalized = t * inv_absmax.unsqueeze(-1)
     lut = _nf4_lut(tensor.device)
-    dists = (normalized.unsqueeze(-1) - lut).abs()         # (..., 16)
+    dists = (normalized.unsqueeze(-1) - lut).abs()  # (..., 16)
     # (out_f, n_groups, blocksize) uint8
     indices = dists.argmin(dim=-1).to(torch.uint8)
     indices = indices.reshape(out_f, in_f)
@@ -120,7 +136,10 @@ def quantize_nf4_blockwise(
 
 
 def dequantize_nf4_blockwise(
-    packed: Tensor, absmax: Tensor, in_f: int, blocksize: int = 64,
+    packed: Tensor,
+    absmax: Tensor,
+    in_f: int,
+    blocksize: int = 64,
     dtype: torch.dtype = torch.float32,
 ) -> Tensor:
     """Inverse of `quantize_nf4_blockwise`."""
@@ -137,15 +156,19 @@ def dequantize_nf4_blockwise(
 # Triton kernels
 # ----------------------------------------------------------------------
 
+
 @triton.jit
 def _dequant_nf4_kernel(
-    packed_ptr,      # (out_f, in_f // 2) uint8
-    absmax_ptr,      # (out_f * n_groups,) fp32
-    lut_ptr,         # (16,) fp32
-    out_ptr,         # (out_f, in_f) out.dtype
-    packed_stride_row, packed_stride_col,
-    out_stride_row, out_stride_col,
-    n_out_rows, n_groups,
+    packed_ptr,  # (out_f, in_f // 2) uint8
+    absmax_ptr,  # (out_f * n_groups,) fp32
+    lut_ptr,  # (16,) fp32
+    out_ptr,  # (out_f, in_f) out.dtype
+    packed_stride_row,
+    packed_stride_col,
+    out_stride_row,
+    out_stride_col,
+    n_out_rows,
+    n_groups,
     BLOCKSIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
@@ -178,21 +201,20 @@ def _dequant_nf4_kernel(
 
     # absmax for this block, per row.
     absmax = tl.load(
-        absmax_ptr + rows * n_groups + pid_g, mask=row_mask,
-    )                                                     # (BLOCK_M,) fp32
+        absmax_ptr + rows * n_groups + pid_g,
+        mask=row_mask,
+    )  # (BLOCK_M,) fp32
 
     high_val = high_val * absmax[:, None]
     low_val = low_val * absmax[:, None]
 
     # Interleave high/low pairs into a contiguous tile, then one store.
-    joined = tl.join(high_val, low_val)                    # (BLOCK_M, BLOCKSIZE//2, 2)
+    joined = tl.join(high_val, low_val)  # (BLOCK_M, BLOCKSIZE//2, 2)
     out_tile = joined.reshape(BLOCK_M, BLOCKSIZE)
 
     out_cols = pid_g * BLOCKSIZE + tl.arange(0, BLOCKSIZE)
     tl.store(
-        out_ptr
-        + rows[:, None] * out_stride_row
-        + out_cols[None, :] * out_stride_col,
+        out_ptr + rows[:, None] * out_stride_row + out_cols[None, :] * out_stride_col,
         out_tile.to(OUT_DTYPE),
         mask=row_mask[:, None],
     )
@@ -206,7 +228,10 @@ _TL_DTYPE_MAP = {
 
 
 def _dequant_nf4_triton(
-    packed: Tensor, absmax: Tensor, in_f: int, blocksize: int,
+    packed: Tensor,
+    absmax: Tensor,
+    in_f: int,
+    blocksize: int,
     out_dtype: torch.dtype,
 ) -> Tensor:
     out_f = packed.shape[0]
@@ -218,10 +243,16 @@ def _dequant_nf4_triton(
     BLOCK_M = 32
     grid = (triton.cdiv(out_f, BLOCK_M), n_groups)
     _dequant_nf4_kernel[grid](
-        packed, absmax, lut, out,
-        packed.stride(0), packed.stride(1),
-        out.stride(0), out.stride(1),
-        out_f, n_groups,
+        packed,
+        absmax,
+        lut,
+        out,
+        packed.stride(0),
+        packed.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out_f,
+        n_groups,
         BLOCKSIZE=blocksize,
         BLOCK_M=BLOCK_M,
         OUT_DTYPE=_TL_DTYPE_MAP[out_dtype],
@@ -231,18 +262,22 @@ def _dequant_nf4_triton(
 
 @triton.jit
 def _quantize_nf4_kernel(
-    input_ptr,       # (out_f, in_f) fp tensor
-    packed_ptr,      # (out_f, in_f // 2) uint8
-    absmax_ptr,      # (out_f * n_groups,) fp32
-    lut_ptr,         # (16,) fp32
-    input_stride_row, input_stride_col,
-    packed_stride_row, packed_stride_col,
-    n_out_rows, n_groups,
+    input_ptr,  # (out_f, in_f) fp tensor
+    packed_ptr,  # (out_f, in_f // 2) uint8
+    absmax_ptr,  # (out_f * n_groups,) fp32
+    lut_ptr,  # (16,) fp32
+    input_stride_row,
+    input_stride_col,
+    packed_stride_row,
+    packed_stride_col,
+    n_out_rows,
+    n_groups,
     EPS: tl.constexpr,
     BLOCKSIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
-    """Per-block absmax + nearest-LUT + 2-nibble pack, one (BLOCK_M, 1 block) tile per program."""
+    """Per-block absmax + nearest-LUT + 2-nibble pack, one (BLOCK_M, 1 block)
+    tile per program."""
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
 
@@ -253,32 +288,31 @@ def _quantize_nf4_kernel(
     cols = pid_g * BLOCKSIZE + col_offs
 
     tile = tl.load(
-        input_ptr
-        + rows[:, None] * input_stride_row
-        + cols[None, :] * input_stride_col,
+        input_ptr + rows[:, None] * input_stride_row + cols[None, :] * input_stride_col,
         mask=row_mask[:, None],
         other=0.0,
-    ).to(tl.float32)                                        # (BLOCK_M, BLOCKSIZE)
+    ).to(tl.float32)  # (BLOCK_M, BLOCKSIZE)
 
-    absmax = tl.max(tl.abs(tile), axis=1)                   # (BLOCK_M,)
+    absmax = tl.max(tl.abs(tile), axis=1)  # (BLOCK_M,)
     inv_abs = tl.extra.libdevice.rcp_rn(tl.maximum(absmax, EPS))
-    normalized = tile * inv_abs[:, None]                    # (BLOCK_M, BLOCKSIZE)
+    normalized = tile * inv_abs[:, None]  # (BLOCK_M, BLOCKSIZE)
 
     # Sequential 16-way min — avoids a (BLOCK_M, BLOCKSIZE, 16) distance tensor.
     best_idx = tl.zeros([BLOCK_M, BLOCKSIZE], dtype=tl.int32)
     best_dist = tl.full([BLOCK_M, BLOCKSIZE], float("inf"), dtype=tl.float32)
     for i in tl.static_range(16):
-        lut_val = tl.load(lut_ptr + i)                      # scalar fp32
+        lut_val = tl.load(lut_ptr + i)  # scalar fp32
         d = tl.abs(normalized - lut_val)
         closer = d < best_dist
         best_idx = tl.where(closer, i, best_idx)
         best_dist = tl.where(closer, d, best_dist)
     # Pack (even → high, odd → low) via weighted-sum reduce.
     idx_pairs = best_idx.reshape(BLOCK_M, BLOCKSIZE // 2, 2)
-    pair_weights = (1 - tl.arange(0, 2)) * 15 + 1            # [16, 1]
+    pair_weights = (1 - tl.arange(0, 2)) * 15 + 1  # [16, 1]
     packed = tl.sum(
-        idx_pairs * pair_weights[None, None, :], axis=2,
-    ).to(tl.uint8)                                           # (BLOCK_M, BLOCKSIZE//2)
+        idx_pairs * pair_weights[None, None, :],
+        axis=2,
+    ).to(tl.uint8)  # (BLOCK_M, BLOCKSIZE//2)
 
     packed_cols = pid_g * (BLOCKSIZE // 2) + tl.arange(0, BLOCKSIZE // 2)
     tl.store(
@@ -291,12 +325,15 @@ def _quantize_nf4_kernel(
 
     # Write one absmax per (row, group).
     tl.store(
-        absmax_ptr + rows * n_groups + pid_g, absmax, mask=row_mask,
+        absmax_ptr + rows * n_groups + pid_g,
+        absmax,
+        mask=row_mask,
     )
 
 
 def _quantize_nf4_triton(
-    tensor: Tensor, blocksize: int,
+    tensor: Tensor,
+    blocksize: int,
 ) -> Tuple[Tensor, Tensor]:
     out_f, in_f = tensor.shape
     assert in_f % blocksize == 0
@@ -304,20 +341,30 @@ def _quantize_nf4_triton(
     n_groups = in_f // blocksize
 
     packed = torch.empty(
-        (out_f, in_f // 2), dtype=torch.uint8, device=tensor.device,
+        (out_f, in_f // 2),
+        dtype=torch.uint8,
+        device=tensor.device,
     )
     absmax = torch.empty(
-        (out_f * n_groups,), dtype=torch.float32, device=tensor.device,
+        (out_f * n_groups,),
+        dtype=torch.float32,
+        device=tensor.device,
     )
     lut = _nf4_lut(tensor.device)
 
     BLOCK_M = 32
     grid = (triton.cdiv(out_f, BLOCK_M), n_groups)
     _quantize_nf4_kernel[grid](
-        tensor, packed, absmax, lut,
-        tensor.stride(0), tensor.stride(1),
-        packed.stride(0), packed.stride(1),
-        out_f, n_groups,
+        tensor,
+        packed,
+        absmax,
+        lut,
+        tensor.stride(0),
+        tensor.stride(1),
+        packed.stride(0),
+        packed.stride(1),
+        out_f,
+        n_groups,
         EPS=1e-12,
         BLOCKSIZE=blocksize,
         BLOCK_M=BLOCK_M,
@@ -329,24 +376,36 @@ def _quantize_nf4_triton(
 # Tensor subclass
 # ----------------------------------------------------------------------
 
+
 class NF4QWeight(QWeightBase):
     """NF4 blockwise QAT weight, bnb storage format (no double-quant)."""
 
     @staticmethod
     @torch._dynamo.disable
     def __new__(
-        cls, weight_packed: Tensor, absmax: Tensor,
-        in_f: int, blocksize: int, outer_dtype: torch.dtype,
+        cls,
+        weight_packed: Tensor,
+        absmax: Tensor,
+        in_f: int,
+        blocksize: int,
+        outer_dtype: torch.dtype,
     ):
         out_f = weight_packed.shape[0]
         return Tensor._make_wrapper_subclass(
-            cls, (out_f, in_f), dtype=outer_dtype, device=weight_packed.device,
+            cls,
+            (out_f, in_f),
+            dtype=outer_dtype,
+            device=weight_packed.device,
         )
 
     @torch._dynamo.disable
     def __init__(
-        self, weight_packed: Tensor, absmax: Tensor,
-        in_f: int, blocksize: int, outer_dtype: torch.dtype,
+        self,
+        weight_packed: Tensor,
+        absmax: Tensor,
+        in_f: int,
+        blocksize: int,
+        outer_dtype: torch.dtype,
     ):
         assert weight_packed.dtype is torch.uint8 and weight_packed.ndim == 2
         assert absmax.dtype is torch.float32 and absmax.ndim == 1
@@ -358,7 +417,9 @@ class NF4QWeight(QWeightBase):
 
     def __tensor_flatten__(self):
         return ["weight_packed", "absmax"], [
-            self.in_f, self.blocksize, self.outer_dtype,
+            self.in_f,
+            self.blocksize,
+            self.outer_dtype,
         ]
 
     @classmethod
@@ -385,12 +446,19 @@ class NF4QWeight(QWeightBase):
             dtype = self.outer_dtype
         if dtype in _TL_DTYPE_MAP:
             return _dequant_nf4_triton(
-                self.weight_packed, self.absmax,
-                self.in_f, self.blocksize, dtype,
+                self.weight_packed,
+                self.absmax,
+                self.in_f,
+                self.blocksize,
+                dtype,
             )
         # Unsupported dtype: python fallback.
         return dequantize_nf4_blockwise(
-            self.weight_packed, self.absmax, self.in_f, self.blocksize, dtype,
+            self.weight_packed,
+            self.absmax,
+            self.in_f,
+            self.blocksize,
+            dtype,
         )
 
     @classmethod
@@ -399,7 +467,8 @@ class NF4QWeight(QWeightBase):
         #   weight: uint8 (numel/2, 1) flat-packed (bnb stores as column vector)
         #   weight.absmax: fp32 (num_blocks,)
         #   weight.quant_map: fp32 (16,) NF4 LUT
-        #   weight.quant_state.bitsandbytes__nf4: uint8 JSON {type, blocksize, dtype, shape}
+        #   weight.quant_state.bitsandbytes__nf4: uint8 JSON
+        #       {type, blocksize, dtype, shape}
         return (
             "weight",
             "weight.absmax",
@@ -422,7 +491,9 @@ class NF4QWeight(QWeightBase):
         }
         meta_bytes = json.dumps(meta).encode("utf-8")
         meta_tensor = torch.tensor(
-            list(meta_bytes), dtype=torch.uint8, device=device,
+            list(meta_bytes),
+            dtype=torch.uint8,
+            device=device,
         )
         return {
             "weight": weight_flat,
@@ -433,9 +504,7 @@ class NF4QWeight(QWeightBase):
 
     @classmethod
     def from_plain_state_dict(cls, plain: dict, reference=None) -> "NF4QWeight":
-        meta_bytes = bytes(
-            plain["weight.quant_state.bitsandbytes__nf4"].cpu().tolist()
-        )
+        meta_bytes = bytes(plain["weight.quant_state.bitsandbytes__nf4"].cpu().tolist())
         meta = json.loads(meta_bytes.decode("utf-8"))
         out_f, in_f = meta["shape"]
         blocksize = meta["blocksize"]
@@ -446,7 +515,10 @@ class NF4QWeight(QWeightBase):
 
     @classmethod
     def build_hf_quantization_config(
-        cls, skip_patterns=(), compute_dtype: str = "bfloat16", **_,
+        cls,
+        skip_patterns=(),
+        compute_dtype: str = "bfloat16",
+        **_,
     ) -> dict:
         return {
             "quant_method": "bitsandbytes",
@@ -468,6 +540,7 @@ class NF4QWeight(QWeightBase):
 # ----------------------------------------------------------------------
 # Autograd: F.linear through the dequantize path
 # ----------------------------------------------------------------------
+
 
 class _NF4WeightOnlyLinear(torch.autograd.Function):
     @staticmethod
@@ -495,6 +568,7 @@ class _NF4WeightOnlyLinear(torch.autograd.Function):
 # Dispatch
 # ----------------------------------------------------------------------
 
+
 @NF4QWeight.implements_torch_function(torch.nn.functional.linear)
 def _(func, types, args, kwargs):
     return _NF4WeightOnlyLinear.apply(*args, **kwargs)
@@ -505,7 +579,9 @@ def _(func, types, args, kwargs):
     out = NF4QWeight(
         func(args[0].weight_packed, *args[1:], **kwargs),
         func(args[0].absmax, *args[1:], **kwargs),
-        args[0].in_f, args[0].blocksize, args[0].outer_dtype,
+        args[0].in_f,
+        args[0].blocksize,
+        args[0].outer_dtype,
     )
     return return_and_correct_aliasing(func, args, kwargs, out)
 
@@ -518,7 +594,9 @@ def _(func, types, args, kwargs):
     out = NF4QWeight(
         args[0].weight_packed.to(device=device),
         args[0].absmax.to(device=device),
-        args[0].in_f, args[0].blocksize, outer,
+        args[0].in_f,
+        args[0].blocksize,
+        outer,
     )
     return return_and_correct_aliasing(func, args, kwargs, out)
 

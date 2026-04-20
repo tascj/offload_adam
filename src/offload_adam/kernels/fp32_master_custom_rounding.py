@@ -1,11 +1,13 @@
 """
 Experimental implementation to reduce memory consumption of fp32 master params.
 
-float32 -> bfloat16 round-to-nearest-even makes it difficult to store the rounding error in 16 bits.
+float32 -> bfloat16 round-to-nearest-even makes it difficult to store
+the rounding error in 16 bits.
 For example, all 65537 values in [0x00018000, 0x00028000] rounds to 0x0002
 We need at least 17 bits to store the rounding error.
 
-In this implementation, 0x____8000 is always rounded up when converting float32 to bfloat16,
+In this implementation, 0x____8000 is always rounded up when converting
+float32 to bfloat16,
 so that the rounding error is in the range [-32768, 32767].
 We could use 16 bits to store the rounding error.
 
@@ -26,6 +28,7 @@ Host memory consumption per parameter:
 import torch
 import triton
 import triton.language as tl
+
 
 @triton.jit
 def decompose(x_fp32):

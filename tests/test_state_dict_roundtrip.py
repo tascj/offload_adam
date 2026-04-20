@@ -54,6 +54,7 @@ def _build_model(weight_cls, kw):
 
 # -------- state_dict contract ------------------------------------------
 
+
 @CUDA
 @pytest.mark.parametrize("weight_cls,kw", DTYPE_CASES)
 def test_state_dict_returns_plain_tensors(weight_cls, kw):
@@ -87,6 +88,7 @@ def test_state_dict_keys_canonical(weight_cls, kw):
 
 # -------- safetensors round-trip ---------------------------------------
 
+
 @CUDA
 @pytest.mark.parametrize("weight_cls,kw", DTYPE_CASES)
 def test_safetensors_round_trip(weight_cls, kw):
@@ -105,6 +107,7 @@ def test_safetensors_round_trip(weight_cls, kw):
 
 
 # -------- torch.load weights_only=True ---------------------------------
+
 
 @CUDA
 @pytest.mark.parametrize("weight_cls,kw", DTYPE_CASES)
@@ -126,6 +129,7 @@ def test_torch_save_weights_only_load(weight_cls, kw):
 
 
 # -------- load_state_dict round-trip -----------------------------------
+
 
 @CUDA
 @pytest.mark.parametrize("weight_cls,kw", DTYPE_CASES)
@@ -176,6 +180,7 @@ def test_load_state_dict_partial_keys_reports_missing(weight_cls, kw):
 
 # -------- subclass-level API (unit check, no module) -------------------
 
+
 @CUDA
 @pytest.mark.parametrize("weight_cls,kw", DTYPE_CASES)
 def test_to_from_plain_state_dict(weight_cls, kw):
@@ -193,6 +198,7 @@ def test_to_from_plain_state_dict(weight_cls, kw):
 
 
 # -------- plain-weight fallback (re-quantize via aten.copy_) -----------
+
 
 @CUDA
 @pytest.mark.parametrize("weight_cls,kw", DTYPE_CASES)

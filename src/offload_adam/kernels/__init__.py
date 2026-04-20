@@ -2,9 +2,9 @@
 Kernel implementations for the Offload Adam optimizer.
 """
 
-from .fp32_master_custom_rounding import adam_step_fp32_master_custom_rounding
 from .fp31_master import adam_step_fp31_master
 from .fp32_master import adam_step_fp32_master
+from .fp32_master_custom_rounding import adam_step_fp32_master_custom_rounding
 from .stochastic_rounding import adam_step_stochastic_rounding
 
 __all__ = [

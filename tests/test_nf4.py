@@ -29,6 +29,7 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 # -------- pack / unpack convention --------------------------------------
 
+
 def test_pack_unpack_roundtrip_cpu():
     torch.manual_seed(0)
     x = torch.randint(0, 16, (6, 32), dtype=torch.uint8)
@@ -60,10 +61,11 @@ def test_nf4_lut_has_sixteen_sorted_values():
     vals = list(NF4_LUT)
     assert vals == sorted(vals)
     assert vals[0] == -1.0 and vals[-1] == 1.0
-    assert 0.0 in vals                                     # zero is a code point
+    assert 0.0 in vals  # zero is a code point
 
 
 # -------- python quantize -----------------------------------------------
+
 
 def test_quantize_nf4_shape_and_dtype():
     torch.manual_seed(0)
@@ -71,7 +73,7 @@ def test_quantize_nf4_shape_and_dtype():
     packed, absmax = quantize_nf4_blockwise(w, blocksize=64)
     assert packed.shape == (64, 256 // 2)
     assert packed.dtype == torch.uint8
-    assert absmax.shape == (64 * 4,)                        # out_f * n_groups
+    assert absmax.shape == (64 * 4,)  # out_f * n_groups
     assert absmax.dtype == torch.float32
     # Indices stored fit in 4 bits.
     idx = unpack_nf4(packed)
@@ -80,15 +82,19 @@ def test_quantize_nf4_shape_and_dtype():
 
 # -------- dequant triton parity -----------------------------------------
 
+
 @CUDA
-@pytest.mark.parametrize("out_f,in_f,blocksize", [
-    (128, 256, 64),
-    (4096, 4096, 64),
-    (12288, 4096, 64),
-    (4096, 11008, 64),
-    (35, 256, 64),       # BLOCK_M-misaligned rows
-    (64, 128, 32),       # smaller blocksize
-])
+@pytest.mark.parametrize(
+    "out_f,in_f,blocksize",
+    [
+        (128, 256, 64),
+        (4096, 4096, 64),
+        (12288, 4096, 64),
+        (4096, 11008, 64),
+        (35, 256, 64),  # BLOCK_M-misaligned rows
+        (64, 128, 32),  # smaller blocksize
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dequant_triton_parity(out_f, in_f, blocksize, dtype):
     torch.manual_seed(0)
@@ -103,7 +109,11 @@ def test_dequant_triton_parity(out_f, in_f, blocksize, dtype):
     am_fp32 = qw.absmax.reshape(out_f, n_groups)
     ref = (vals_fp32 * am_fp32.unsqueeze(-1)).reshape(out_f, in_f).to(dtype)
     got = _dequant_nf4_triton(
-        qw.weight_packed, qw.absmax, in_f, blocksize, dtype,
+        qw.weight_packed,
+        qw.absmax,
+        in_f,
+        blocksize,
+        dtype,
     )
     assert got.shape == ref.shape
     assert got.dtype == ref.dtype
@@ -115,6 +125,7 @@ def test_dequant_triton_parity(out_f, in_f, blocksize, dtype):
 
 # -------- F.linear dispatch ---------------------------------------------
 
+
 @CUDA
 def test_linear_autograd_matches_dequant_reference():
     torch.manual_seed(0)
@@ -125,7 +136,11 @@ def test_linear_autograd_matches_dequant_reference():
     qw.requires_grad_(True)
     b.requires_grad_(True)
     x = torch.randn(
-        batch, in_f, dtype=torch.bfloat16, device="cuda", requires_grad=True,
+        batch,
+        in_f,
+        dtype=torch.bfloat16,
+        device="cuda",
+        requires_grad=True,
     )
 
     y = F.linear(x, qw, b)
@@ -146,15 +161,19 @@ def test_linear_autograd_matches_dequant_reference():
 
 # -------- triton quantize parity ----------------------------------------
 
+
 @CUDA
-@pytest.mark.parametrize("out_f,in_f,blocksize", [
-    (128, 256, 64),
-    (4096, 4096, 64),
-    (12288, 4096, 64),
-    (4096, 11008, 64),
-    (35, 256, 64),
-    (64, 128, 32),
-])
+@pytest.mark.parametrize(
+    "out_f,in_f,blocksize",
+    [
+        (128, 256, 64),
+        (4096, 4096, 64),
+        (12288, 4096, 64),
+        (4096, 11008, 64),
+        (35, 256, 64),
+        (64, 128, 32),
+    ],
+)
 @pytest.mark.parametrize("src_dtype", [torch.bfloat16, torch.float32])
 def test_quantize_triton_parity(out_f, in_f, blocksize, src_dtype):
     torch.manual_seed(0)
@@ -166,8 +185,7 @@ def test_quantize_triton_parity(out_f, in_f, blocksize, src_dtype):
     assert got_absmax.shape == ref_absmax.shape
     assert got_absmax.dtype == torch.float32
     assert torch.equal(got_absmax, ref_absmax), (
-        f"absmax mismatch: max_abs="
-        f"{(got_absmax - ref_absmax).abs().max()}"
+        f"absmax mismatch: max_abs={(got_absmax - ref_absmax).abs().max()}"
     )
     # Rare tied-distance cases: a value exactly at the midpoint between
     # two LUT codes can resolve to either side depending on fp precision.

@@ -60,9 +60,7 @@ def _build(quantize: bool, cls=_Tiny):
 
 
 def _count_master_warnings(caught):
-    return sum(
-        1 for w in caught if "lossy dequant-seeded" in str(w.message)
-    )
+    return sum(1 for w in caught if "lossy dequant-seeded" in str(w.message))
 
 
 def _save_safetensors(model, path: Path, keys=None):
@@ -81,12 +79,16 @@ def _save_safetensors(model, path: Path, keys=None):
 
 # -------- quantize_linears report ------------------------------------
 
+
 @CUDA
 def test_quantize_linears_returns_report():
     torch.manual_seed(0)
     m = _Two().to(torch.bfloat16).cuda()
     report = quantize_linears(
-        m, Int4QWeight, group_size=128, skip_patterns=("l2",),
+        m,
+        Int4QWeight,
+        group_size=128,
+        skip_patterns=("l2",),
     )
     assert isinstance(report, QuantizeReport)
     assert report.quantized == ["l1"]
@@ -103,6 +105,7 @@ def test_quantize_linears_strict_raises_on_incompatible():
 
 
 # -------- init seeds master (lossy for quant, lossless for non-quant) --
+
 
 @CUDA
 def test_adam_qat_init_seeds_dequant_master_with_flag():
@@ -123,7 +126,8 @@ def test_adam_nonquant_init_fills_master_from_data():
     state = opt.state[m.l1.weight]
     opt._init_state_if_empty(m.l1.weight, state)
     assert torch.equal(
-        state["master_params"], m.l1.weight.data.to(torch.float32),
+        state["master_params"],
+        m.l1.weight.data.to(torch.float32),
     )
     assert "master_filled" not in state
 
@@ -138,6 +142,7 @@ def test_offload_adam_qat_alloc_marks_master_unfilled():
 
 
 # -------- step-time warning -----------------------------------------
+
 
 @CUDA
 def test_adam_qat_warns_once_when_master_lossy():
@@ -189,6 +194,7 @@ def test_adam_nonquant_never_warns():
 
 # -------- load_master_from_pretrained -------------------------------
 
+
 @CUDA
 def test_load_master_from_pretrained_single_file(tmp_path):
     """Save fp32 master from a pre-quantize model, quantize, construct
@@ -214,6 +220,7 @@ def test_load_master_from_pretrained_single_file(tmp_path):
 def test_load_master_from_pretrained_skips_non_quant(tmp_path):
     """Non-quant params (LayerNorm, biases) are skipped — they already
     have a lossless master from optim init."""
+
     class _Mixed(nn.Module):
         def __init__(self):
             super().__init__()
@@ -240,7 +247,8 @@ def test_load_master_from_pretrained_skips_non_quant(tmp_path):
     # happens at step time. Force init and verify it matches `p.data`.
     opt._init_state_if_empty(m.ln.weight, opt.state[m.ln.weight])
     assert torch.equal(
-        opt.state[m.ln.weight]["master_params"], ln_weight_pre,
+        opt.state[m.ln.weight]["master_params"],
+        ln_weight_pre,
     )
     assert "master_filled" not in opt.state[m.ln.weight]
 
@@ -292,10 +300,12 @@ def test_load_master_from_pretrained_sharded_dir(tmp_path):
     missing = opt.load_master_from_pretrained(tmp_path, m, strict=True)
     assert missing == []
     assert torch.equal(
-        opt.state[m.l1.weight]["master_params"], expected_l1,
+        opt.state[m.l1.weight]["master_params"],
+        expected_l1,
     )
     assert torch.equal(
-        opt.state[m.l2.weight]["master_params"], expected_l2,
+        opt.state[m.l2.weight]["master_params"],
+        expected_l2,
     )
 
 
@@ -338,6 +348,7 @@ def test_offload_adam_load_master_from_pretrained(tmp_path):
 
 # -------- advanced load_master_state_dict ----------------------------
 
+
 @CUDA
 def test_adam_load_master_state_dict_strict_rejects_typo():
     m = _build(quantize=True)
@@ -357,6 +368,7 @@ def test_adam_load_master_state_dict_returns_unexpected():
 
 
 # -------- resume round-trip ------------------------------------------
+
 
 @CUDA
 def test_adam_qat_state_dict_round_trip_preserves_fp32_and_flag(tmp_path):
@@ -401,6 +413,7 @@ def test_offload_adam_load_state_dict_raises():
 
 
 # -------- key shape regression ---------------------------------------
+
 
 @CUDA
 def test_quantize_linears_top_level_linear_key_has_no_leading_dot():

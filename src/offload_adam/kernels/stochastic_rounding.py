@@ -17,6 +17,7 @@ Host memory consumption per parameter:
 """
 
 import random
+
 import triton
 import triton.language as tl
 

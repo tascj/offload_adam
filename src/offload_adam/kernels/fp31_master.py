@@ -2,7 +2,8 @@
 Experimental implementation to reduce memory consumption of fp32 master params.
 
 Dropping the lowest bit of fp32 mantissa (round to nearest even).
-Losing 1 bit of precision, but fp31 -> (bfloat16, int16 error) -> fp31 should be lossless.
+Losing 1 bit of precision, but fp31 -> (bfloat16, int16 error) -> fp31
+should be lossless.
 
 
 +----------------+-------------+
@@ -83,7 +84,7 @@ def adam_step_fp31_master_kernel(
     master_params = reconstruct(params, rounding_error)
 
     if DECOUPLED_WEIGHT_DECAY:
-        master_params = master_params - lr *weight_decay * master_params
+        master_params = master_params - lr * weight_decay * master_params
     else:
         grad = grad + weight_decay * master_params
     exp_avg = exp_avg + (1 - beta1_hat) * (grad - exp_avg)

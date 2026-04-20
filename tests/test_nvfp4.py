@@ -31,13 +31,13 @@ from offload_adam.qweight.nvfp4 import (
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 BLACKWELL = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not _nvfp4_mod._supports_native_fp4(),
+    not torch.cuda.is_available() or not _nvfp4_mod._supports_native_fp4(),
     reason="Blackwell (sm_100+) required for native-vs-fallback parity",
 )
 
 
 # -------- pack / unpack convention --------------------------------------
+
 
 def test_pack_unpack_roundtrip_cpu():
     torch.manual_seed(0)
@@ -76,6 +76,7 @@ def test_fp4_lut_has_sixteen_e2m1_values():
 
 # -------- python quantize -----------------------------------------------
 
+
 def test_quantize_nvfp4_shape_and_dtype():
     torch.manual_seed(0)
     w = torch.randn(64, 256, dtype=torch.float32) * 0.05
@@ -84,7 +85,7 @@ def test_quantize_nvfp4_shape_and_dtype():
     assert packed.dtype == torch.uint8
     assert scale.shape == (64, 256 // NVFP4_BLOCKSIZE)
     assert scale.dtype == torch.float8_e4m3fn
-    assert gs.shape == ()                                    # scalar
+    assert gs.shape == ()  # scalar
     assert gs.dtype == torch.float32
     # All FP4 indices fit in 4 bits.
     idx = unpack_fp4(packed)
@@ -93,14 +94,18 @@ def test_quantize_nvfp4_shape_and_dtype():
 
 # -------- dequant triton parity -----------------------------------------
 
+
 @CUDA
-@pytest.mark.parametrize("out_f,in_f", [
-    (128, 256),
-    (4096, 4096),
-    (12288, 4096),
-    (4096, 11008),
-    (35, 256),
-])
+@pytest.mark.parametrize(
+    "out_f,in_f",
+    [
+        (128, 256),
+        (4096, 4096),
+        (12288, 4096),
+        (4096, 11008),
+        (35, 256),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dequant_triton_parity(out_f, in_f, dtype):
     torch.manual_seed(0)
@@ -110,12 +115,16 @@ def test_dequant_triton_parity(out_f, in_f, dtype):
     lut_fp32 = _fp4_lut(qw.weight_packed.device, dtype=torch.float32)
     n_groups = in_f // NVFP4_BLOCKSIZE
     vals_fp32 = lut_fp32[idx].reshape(out_f, n_groups, NVFP4_BLOCKSIZE)
-    eff = (
-        qw.block_scale_fp8.to(torch.float32) * qw.global_scale
-    ).reshape(out_f, n_groups)
+    eff = (qw.block_scale_fp8.to(torch.float32) * qw.global_scale).reshape(
+        out_f, n_groups
+    )
     ref = (vals_fp32 * eff.unsqueeze(-1)).reshape(out_f, in_f).to(dtype)
     got = _dequant_nvfp4_triton(
-        qw.weight_packed, qw.block_scale_fp8, qw.global_scale, in_f, dtype,
+        qw.weight_packed,
+        qw.block_scale_fp8,
+        qw.global_scale,
+        in_f,
+        dtype,
     )
     assert got.shape == ref.shape
     assert got.dtype == ref.dtype
@@ -127,6 +136,7 @@ def test_dequant_triton_parity(out_f, in_f, dtype):
 
 # -------- F.linear dispatch ---------------------------------------------
 
+
 @CUDA
 def test_linear_autograd_matches_dequant_reference():
     torch.manual_seed(0)
@@ -137,7 +147,11 @@ def test_linear_autograd_matches_dequant_reference():
     qw.requires_grad_(True)
     b.requires_grad_(True)
     x = torch.randn(
-        batch, in_f, dtype=torch.bfloat16, device="cuda", requires_grad=True,
+        batch,
+        in_f,
+        dtype=torch.bfloat16,
+        device="cuda",
+        requires_grad=True,
     )
 
     y = F.linear(x, qw, b)
@@ -158,14 +172,18 @@ def test_linear_autograd_matches_dequant_reference():
 
 # -------- triton quantize parity ----------------------------------------
 
+
 @CUDA
-@pytest.mark.parametrize("out_f,in_f", [
-    (128, 256),
-    (4096, 4096),
-    (12288, 4096),
-    (4096, 11008),
-    (35, 256),
-])
+@pytest.mark.parametrize(
+    "out_f,in_f",
+    [
+        (128, 256),
+        (4096, 4096),
+        (12288, 4096),
+        (4096, 11008),
+        (35, 256),
+    ],
+)
 @pytest.mark.parametrize("src_dtype", [torch.bfloat16, torch.float32])
 def test_quantize_triton_parity(out_f, in_f, src_dtype):
     torch.manual_seed(0)
@@ -180,7 +198,8 @@ def test_quantize_triton_parity(out_f, in_f, src_dtype):
     assert got_gs.dtype == torch.float32
     assert torch.equal(got_gs, ref_gs)
     assert torch.equal(
-        got_scale.to(torch.float32), ref_scale.to(torch.float32),
+        got_scale.to(torch.float32),
+        ref_scale.to(torch.float32),
     )
     # With RNE-matching software reference, hardware and soft bit-op paths
     # now produce byte-identical packed output.
@@ -202,12 +221,14 @@ def test_copy_fp32_to_nvfp4_matches_fresh_quantize():
 
     ref_packed, ref_scale, ref_gs = _quantize_nvfp4_triton(new_w)
     assert torch.equal(qw.weight_packed, ref_packed)
-    assert torch.equal(qw.block_scale_fp8.to(torch.float32),
-                       ref_scale.to(torch.float32))
+    assert torch.equal(
+        qw.block_scale_fp8.to(torch.float32), ref_scale.to(torch.float32)
+    )
     assert torch.equal(qw.global_scale, ref_gs)
 
 
 # -------- Exhaustive decoder / RNE quantize edge cases -----------------
+
 
 @CUDA
 def test_fp4_code_to_fp32_exhaustive_via_dequant_kernel():
@@ -223,15 +244,21 @@ def test_fp4_code_to_fp32_exhaustive_via_dequant_kernel():
     packed = torch.tensor(rows, dtype=torch.uint8, device="cuda").reshape(1, 128)
     # block_scale_fp8 = 1 on every block; global_scale = 1 → effective = 1.
     block_scale_fp8 = torch.ones(
-        (1, 16), dtype=torch.float8_e4m3fn, device="cuda",
+        (1, 16),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
     )
     global_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
     qw = NVFP4QWeight(
-        packed, block_scale_fp8, global_scale, in_f=256, outer_dtype=torch.bfloat16,
+        packed,
+        block_scale_fp8,
+        global_scale,
+        in_f=256,
+        outer_dtype=torch.bfloat16,
     )
     deq = qw.dequantize(torch.float32).reshape(-1)
     for j in range(16):
-        block = deq[j * 16: (j + 1) * 16]
+        block = deq[j * 16 : (j + 1) * 16]
         expected_val = FP4_E2M1_LUT[j]
         assert (block == expected_val).all(), (
             f"code {j} decoded to {block[:4].tolist()}..., expected {expected_val}"
@@ -277,43 +304,50 @@ def test_rne_quantize_boundaries(sign):
     eps = 1e-3
     # (input magnitude, expected FP4 value)
     cases = [
-        (0.0,       0.0),
-        (0.1,       0.0),   # rounds to 0
-        (0.25,      0.0),   # tie → 0
+        (0.0, 0.0),
+        (0.1, 0.0),  # rounds to 0
+        (0.25, 0.0),  # tie → 0
         (0.25 + eps, 0.5),
-        (0.5,       0.5),
+        (0.5, 0.5),
         (0.75 - eps, 0.5),
-        (0.75,      1.0),   # tie → 1
+        (0.75, 1.0),  # tie → 1
         (0.75 + eps, 1.0),
-        (1.0,       1.0),
+        (1.0, 1.0),
         (1.25 - eps, 1.0),
-        (1.25,      1.0),   # tie → 1
+        (1.25, 1.0),  # tie → 1
         (1.25 + eps, 1.5),
-        (1.5,       1.5),
+        (1.5, 1.5),
         (1.75 - eps, 1.5),
-        (1.75,      2.0),   # tie → 2
+        (1.75, 2.0),  # tie → 2
         (1.75 + eps, 2.0),
-        (2.0,       2.0),
+        (2.0, 2.0),
         (2.5 - eps, 2.0),
-        (2.5,       2.0),   # tie → 2
+        (2.5, 2.0),  # tie → 2
         (2.5 + eps, 3.0),
-        (3.0,       3.0),
+        (3.0, 3.0),
         (3.5 - eps, 3.0),
-        (3.5,       4.0),   # tie → 4
+        (3.5, 4.0),  # tie → 4
         (3.5 + eps, 4.0),
-        (4.0,       4.0),
+        (4.0, 4.0),
         (5.0 - eps, 4.0),
-        (5.0,       4.0),   # tie → 4
+        (5.0, 4.0),  # tie → 4
         (5.0 + eps, 6.0),
-        (6.0,       6.0),
-        (1e6,       6.0),   # saturate
+        (6.0, 6.0),
+        (1e6, 6.0),  # saturate
     ]
     mags = torch.tensor(
-        [m for m, _ in cases], dtype=torch.float32, device="cuda",
+        [m for m, _ in cases],
+        dtype=torch.float32,
+        device="cuda",
     )
-    expected = torch.tensor(
-        [e for _, e in cases], dtype=torch.float32, device="cuda",
-    ) * sign
+    expected = (
+        torch.tensor(
+            [e for _, e in cases],
+            dtype=torch.float32,
+            device="cuda",
+        )
+        * sign
+    )
     x = mags * sign
     codes = _quantize_fp4_e2m1_rne(x).cpu().tolist()
     lut = torch.tensor(FP4_E2M1_LUT, dtype=torch.float32, device="cuda")
@@ -337,16 +371,38 @@ def test_large_random_stress_matches_native():
     # to blocks-per-row, so a million-wide row overflows CUDA's 65k
     # grid-y limit. Same total element count, stays within limits.
     out_f, in_f = 256, 4096
-    rand = torch.randn(out_f, in_f - 34, device="cuda") * 2.0     # ~[-8, 8]
+    rand = torch.randn(out_f, in_f - 34, device="cuda") * 2.0  # ~[-8, 8]
     boundaries = torch.tensor(
-        [0.0, -0.0, 0.25, -0.25, 0.75, -0.75, 1.25, 1.75, 2.5, 3.5, 5.0,
-         6.0, -6.0, 10.0, -10.0, 1e6, -1e6],
-        dtype=torch.float32, device="cuda",
-    )                                                              # (17,)
+        [
+            0.0,
+            -0.0,
+            0.25,
+            -0.25,
+            0.75,
+            -0.75,
+            1.25,
+            1.75,
+            2.5,
+            3.5,
+            5.0,
+            6.0,
+            -6.0,
+            10.0,
+            -10.0,
+            1e6,
+            -1e6,
+        ],
+        dtype=torch.float32,
+        device="cuda",
+    )  # (17,)
     # Seed the first row with exact boundary values + their negatives.
-    rand_first = torch.cat([
-        boundaries, -boundaries, torch.zeros(in_f - 34, device="cuda"),
-    ])[:in_f]
+    rand_first = torch.cat(
+        [
+            boundaries,
+            -boundaries,
+            torch.zeros(in_f - 34, device="cuda"),
+        ]
+    )[:in_f]
     w = rand.clone()
     w = torch.cat([w, torch.zeros(out_f, 34, device="cuda")], dim=1)
     w[0] = rand_first
@@ -367,8 +423,7 @@ def test_large_random_stress_matches_native():
     assert torch.equal(gs_n, gs_l)
     assert torch.equal(sc_n.to(torch.float32), sc_l.to(torch.float32))
     assert torch.equal(pk_n, pk_l), (
-        f"stress test divergence: "
-        f"{(pk_n != pk_l).sum().item()}/{pk_n.numel()} bytes"
+        f"stress test divergence: {(pk_n != pk_l).sum().item()}/{pk_n.numel()} bytes"
     )
 
 
@@ -377,10 +432,11 @@ def test_can_quantize():
     assert NVFP4QWeight.can_quantize(torch.empty(4, 256))
     assert not NVFP4QWeight.can_quantize(torch.empty(16))
     assert not NVFP4QWeight.can_quantize(torch.empty(4, 4, 4))
-    assert not NVFP4QWeight.can_quantize(torch.empty(4, 15))   # < blocksize
+    assert not NVFP4QWeight.can_quantize(torch.empty(4, 15))  # < blocksize
 
 
 # -------- fallback (soft bit-op) path parity ---------------------------
+
 
 @BLACKWELL
 def test_native_vs_soft_fallback_parity(monkeypatch):
@@ -404,8 +460,7 @@ def test_native_vs_soft_fallback_parity(monkeypatch):
     assert torch.equal(gs_n, gs_l)
     assert torch.equal(sc_n.to(torch.float32), sc_l.to(torch.float32))
     assert torch.equal(pk_n, pk_l), (
-        f"packed byte divergence: "
-        f"{(pk_n != pk_l).sum().item()}/{pk_n.numel()}"
+        f"packed byte divergence: {(pk_n != pk_l).sum().item()}/{pk_n.numel()}"
     )
     # Dequant values are bit-equal modulo signed-zero: -0.0 and 0.0
     # compare equal under arithmetic `==` but differ under `torch.equal`.
@@ -438,6 +493,6 @@ def test_fp8_e4m3_bit_synth_matches_torch_cast():
     is_nan_got = torch.isnan(out)
     assert torch.equal(is_nan_ref, is_nan_got)
     finite = ~is_nan_ref
-    assert torch.equal(
-        out[finite].view(torch.int32), ref[finite].view(torch.int32)
-    ), f"bit mismatch at indices {(out[finite] != ref[finite]).nonzero().flatten()}"
+    assert torch.equal(out[finite].view(torch.int32), ref[finite].view(torch.int32)), (
+        f"bit mismatch at indices {(out[finite] != ref[finite]).nonzero().flatten()}"
+    )

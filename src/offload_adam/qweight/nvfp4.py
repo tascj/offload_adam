@@ -32,8 +32,22 @@ FP8_E4M3_MAX = 448.0
 # FP4 E2M1 codebook indexed by 4-bit code:
 #   bit 3 = sign, bits 2..1 = exponent (bias 1), bit 0 = mantissa.
 FP4_E2M1_LUT = (
-     0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 )
 
 
@@ -54,6 +68,7 @@ def _fp4_lut(device: torch.device, dtype: torch.dtype = torch.float32) -> Tensor
 # Python reference: pack / unpack / quantize
 # ----------------------------------------------------------------------
 
+
 def pack_fp4(indices: Tensor) -> Tensor:
     """(out_f, in_f) uint8 indices (0..15) → (out_f, in_f // 2) uint8.
 
@@ -73,7 +88,9 @@ def unpack_fp4(packed: Tensor) -> Tensor:
     high = (packed >> 4) & 0xF
     out_f, half_in_f = packed.shape
     result = torch.empty(
-        (out_f, 2 * half_in_f), dtype=torch.uint8, device=packed.device,
+        (out_f, 2 * half_in_f),
+        dtype=torch.uint8,
+        device=packed.device,
     )
     result[:, 0::2] = low
     result[:, 1::2] = high
@@ -115,7 +132,8 @@ def _quantize_fp4_e2m1_rne(x: Tensor) -> Tensor:
 
 @torch.no_grad()
 def quantize_nvfp4_blockwise(
-    tensor: Tensor, eps: float = 1e-12,
+    tensor: Tensor,
+    eps: float = 1e-12,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Reference python NVFP4 quantize — bit-matches the native PTX path.
 
@@ -139,7 +157,7 @@ def quantize_nvfp4_blockwise(
     inv_global = 1.0 / global_scale
 
     t_b = t.reshape(out_f, n_groups, NVFP4_BLOCKSIZE)
-    block_amax = t_b.abs().amax(dim=-1).clamp(min=eps)     # (out_f, n_groups)
+    block_amax = t_b.abs().amax(dim=-1).clamp(min=eps)  # (out_f, n_groups)
     block_scale_fp32 = block_amax / FP4_E2M1_MAX
     block_scale_fp8 = (block_scale_fp32 * inv_global).to(torch.float8_e4m3fn)
 
@@ -156,17 +174,20 @@ def quantize_nvfp4_blockwise(
 
 
 def dequantize_nvfp4_blockwise(
-    packed: Tensor, block_scale_fp8: Tensor, global_scale: Tensor,
-    in_f: int, dtype: torch.dtype = torch.float32,
+    packed: Tensor,
+    block_scale_fp8: Tensor,
+    global_scale: Tensor,
+    in_f: int,
+    dtype: torch.dtype = torch.float32,
 ) -> Tensor:
     out_f = packed.shape[0]
     n_groups = in_f // NVFP4_BLOCKSIZE
     indices = unpack_fp4(packed).to(torch.long)
     lut = _fp4_lut(packed.device, dtype=torch.float32)
     vals_fp32 = lut[indices].reshape(out_f, n_groups, NVFP4_BLOCKSIZE)
-    effective = (
-        block_scale_fp8.to(torch.float32) * global_scale
-    ).reshape(out_f, n_groups)
+    effective = (block_scale_fp8.to(torch.float32) * global_scale).reshape(
+        out_f, n_groups
+    )
     return (vals_fp32 * effective.unsqueeze(-1)).reshape(out_f, in_f).to(dtype)
 
 
@@ -210,7 +231,8 @@ def _fp8_e4m3_bits_to_fp32(bits_u8):
     # Subnormal: value = mant * 2^-9; mant=0 yields +0.
     subnormal_bits = (mant.to(tl.float32) * (1.0 / 512.0)).to(tl.int32, bitcast=True)
     abs_bits = tl.where(
-        is_nan, 0x7FC00000,
+        is_nan,
+        0x7FC00000,
         tl.where(is_zero_or_subnormal, subnormal_bits, normal_bits),
     )
     return (abs_bits | sign).to(tl.float32, bitcast=True)
@@ -241,14 +263,18 @@ def _fp4_code_to_fp32(idx):
 
 @triton.jit
 def _dequant_nvfp4_kernel_soft(
-    packed_ptr,           # (out_f, in_f // 2) uint8
-    block_scale_u8_ptr,   # (out_f, n_groups) uint8 view of fp8_e4m3fn
-    global_scale_ptr,     # () fp32 scalar
-    out_ptr,              # (out_f, in_f) out.dtype
-    packed_stride_row, packed_stride_col,
-    scale_stride_row, scale_stride_col,
-    out_stride_row, out_stride_col,
-    n_out_rows, n_groups,
+    packed_ptr,  # (out_f, in_f // 2) uint8
+    block_scale_u8_ptr,  # (out_f, n_groups) uint8 view of fp8_e4m3fn
+    global_scale_ptr,  # () fp32 scalar
+    out_ptr,  # (out_f, in_f) out.dtype
+    packed_stride_row,
+    packed_stride_col,
+    scale_stride_row,
+    scale_stride_col,
+    out_stride_row,
+    out_stride_col,
+    n_out_rows,
+    n_groups,
     BLOCKSIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
@@ -269,7 +295,7 @@ def _dequant_nvfp4_kernel_soft(
         + packed_cols[None, :] * packed_stride_col,
         mask=row_mask[:, None],
         other=0,
-    )                                                       # (BLOCK_M, BLOCKSIZE//2)
+    )  # (BLOCK_M, BLOCKSIZE//2)
 
     # Even col → low nibble, odd → high.
     low_idx = (p & 0xF).to(tl.int32)
@@ -280,27 +306,23 @@ def _dequant_nvfp4_kernel_soft(
 
     # Reconstruct effective fp32 scale for this block via bit synthesis.
     scale_u8 = tl.load(
-        block_scale_u8_ptr
-        + rows * scale_stride_row
-        + pid_g * scale_stride_col,
+        block_scale_u8_ptr + rows * scale_stride_row + pid_g * scale_stride_col,
         mask=row_mask,
-    )                                                       # (BLOCK_M,) uint8
+    )  # (BLOCK_M,) uint8
     scale_fp32 = _fp8_e4m3_bits_to_fp32(scale_u8)
-    global_scale = tl.load(global_scale_ptr)                # scalar fp32
+    global_scale = tl.load(global_scale_ptr)  # scalar fp32
     effective = scale_fp32 * global_scale
 
     low_val = low_val * effective[:, None]
     high_val = high_val * effective[:, None]
 
     # Interleave: even cols ← low, odd cols ← high (matches packing).
-    joined = tl.join(low_val, high_val)                     # (BLOCK_M, BLOCKSIZE//2, 2)
+    joined = tl.join(low_val, high_val)  # (BLOCK_M, BLOCKSIZE//2, 2)
     out_tile = joined.reshape(BLOCK_M, BLOCKSIZE)
 
     out_cols = pid_g * BLOCKSIZE + tl.arange(0, BLOCKSIZE)
     tl.store(
-        out_ptr
-        + rows[:, None] * out_stride_row
-        + out_cols[None, :] * out_stride_col,
+        out_ptr + rows[:, None] * out_stride_row + out_cols[None, :] * out_stride_col,
         out_tile.to(OUT_DTYPE),
         mask=row_mask[:, None],
     )
@@ -308,19 +330,24 @@ def _dequant_nvfp4_kernel_soft(
 
 @triton.jit
 def _dequant_nvfp4_kernel_native(
-    packed_ptr,           # (out_f, in_f // 2) uint8
+    packed_ptr,  # (out_f, in_f // 2) uint8
     block_scale_fp8_ptr,  # (out_f, n_groups) fp8_e4m3
-    global_scale_ptr,     # () fp32 scalar
-    out_ptr,              # (out_f, in_f) out.dtype
-    packed_stride_row, packed_stride_col,
-    scale_stride_row, scale_stride_col,
-    out_stride_row, out_stride_col,
-    n_out_rows, n_groups,
+    global_scale_ptr,  # () fp32 scalar
+    out_ptr,  # (out_f, in_f) out.dtype
+    packed_stride_row,
+    packed_stride_col,
+    scale_stride_row,
+    scale_stride_col,
+    out_stride_row,
+    out_stride_col,
+    n_out_rows,
+    n_groups,
     BLOCKSIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
 ):
-    """Blackwell-native dequant: ``cvt.rn.f16x2.e2m1x2`` decodes 2 FP4 → 2 FP16 per byte."""
+    """Blackwell-native dequant: ``cvt.rn.f16x2.e2m1x2`` decodes 2 FP4 → 2 FP16
+    per byte."""
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
 
@@ -360,34 +387,33 @@ def _dequant_nvfp4_kernel_native(
     high_bits = (pair_i32 >> 16).to(tl.int16)
     even_fp16 = low_bits.to(tl.float16, bitcast=True)
     odd_fp16 = high_bits.to(tl.float16, bitcast=True)
-    joined = tl.join(even_fp16, odd_fp16)                   # (BLOCK_M, BLOCKSIZE//2, 2)
+    joined = tl.join(even_fp16, odd_fp16)  # (BLOCK_M, BLOCKSIZE//2, 2)
     tile_fp16 = joined.reshape(BLOCK_M, BLOCKSIZE)
 
     # Reconstruct effective fp32 scale per block.
     block_scale_fp8 = tl.load(
-        block_scale_fp8_ptr
-        + rows * scale_stride_row
-        + pid_g * scale_stride_col,
+        block_scale_fp8_ptr + rows * scale_stride_row + pid_g * scale_stride_col,
         mask=row_mask,
     )
     global_scale = tl.load(global_scale_ptr)
-    effective = block_scale_fp8.to(tl.float32) * global_scale   # (BLOCK_M,)
+    effective = block_scale_fp8.to(tl.float32) * global_scale  # (BLOCK_M,)
 
     out_tile = tile_fp16.to(tl.float32) * effective[:, None]
 
     out_cols = pid_g * BLOCKSIZE + tl.arange(0, BLOCKSIZE)
     tl.store(
-        out_ptr
-        + rows[:, None] * out_stride_row
-        + out_cols[None, :] * out_stride_col,
+        out_ptr + rows[:, None] * out_stride_row + out_cols[None, :] * out_stride_col,
         out_tile.to(OUT_DTYPE),
         mask=row_mask[:, None],
     )
 
 
 def _dequant_nvfp4_triton(
-    packed: Tensor, block_scale_fp8: Tensor, global_scale: Tensor,
-    in_f: int, out_dtype: torch.dtype,
+    packed: Tensor,
+    block_scale_fp8: Tensor,
+    global_scale: Tensor,
+    in_f: int,
+    out_dtype: torch.dtype,
 ) -> Tensor:
     out_f = packed.shape[0]
     n_groups = in_f // NVFP4_BLOCKSIZE
@@ -397,11 +423,18 @@ def _dequant_nvfp4_triton(
     grid = (triton.cdiv(out_f, BLOCK_M), n_groups)
     if _supports_native_fp4():
         _dequant_nvfp4_kernel_native[grid](
-            packed, block_scale_fp8, global_scale, out,
-            packed.stride(0), packed.stride(1),
-            block_scale_fp8.stride(0), block_scale_fp8.stride(1),
-            out.stride(0), out.stride(1),
-            out_f, n_groups,
+            packed,
+            block_scale_fp8,
+            global_scale,
+            out,
+            packed.stride(0),
+            packed.stride(1),
+            block_scale_fp8.stride(0),
+            block_scale_fp8.stride(1),
+            out.stride(0),
+            out.stride(1),
+            out_f,
+            n_groups,
             BLOCKSIZE=NVFP4_BLOCKSIZE,
             BLOCK_M=BLOCK_M,
             OUT_DTYPE=_TL_DTYPE_MAP[out_dtype],
@@ -409,11 +442,18 @@ def _dequant_nvfp4_triton(
     else:
         scale_u8 = block_scale_fp8.view(torch.uint8)
         _dequant_nvfp4_kernel_soft[grid](
-            packed, scale_u8, global_scale, out,
-            packed.stride(0), packed.stride(1),
-            scale_u8.stride(0), scale_u8.stride(1),
-            out.stride(0), out.stride(1),
-            out_f, n_groups,
+            packed,
+            scale_u8,
+            global_scale,
+            out,
+            packed.stride(0),
+            packed.stride(1),
+            scale_u8.stride(0),
+            scale_u8.stride(1),
+            out.stride(0),
+            out.stride(1),
+            out_f,
+            n_groups,
             BLOCKSIZE=NVFP4_BLOCKSIZE,
             BLOCK_M=BLOCK_M,
             OUT_DTYPE=_TL_DTYPE_MAP[out_dtype],
@@ -423,24 +463,28 @@ def _dequant_nvfp4_triton(
 
 @triton.jit
 def _quantize_nvfp4_prologue(
-    input_ptr, block_scale_fp8_ptr, global_scale_ptr,
-    input_stride_row, input_stride_col,
-    scale_stride_row, scale_stride_col,
+    input_ptr,
+    block_scale_fp8_ptr,
+    global_scale_ptr,
+    input_stride_row,
+    input_stride_col,
+    scale_stride_row,
+    scale_stride_col,
     n_out_rows,
     EPS: tl.constexpr,
     BLOCKSIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
-    pid_m, pid_g,
+    pid_m,
+    pid_g,
 ):
-    """Native-path prologue: load tile, write per-block fp8 scale, return normalized fp32 tile."""
+    """Native-path prologue: load tile, write per-block fp8 scale, return
+    normalized fp32 tile."""
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = rows < n_out_rows
     cols = pid_g * BLOCKSIZE + tl.arange(0, BLOCKSIZE)
 
     tile = tl.load(
-        input_ptr
-        + rows[:, None] * input_stride_row
-        + cols[None, :] * input_stride_col,
+        input_ptr + rows[:, None] * input_stride_row + cols[None, :] * input_stride_col,
         mask=row_mask[:, None],
         other=0.0,
     ).to(tl.float32)
@@ -453,10 +497,9 @@ def _quantize_nvfp4_prologue(
     block_scale_fp8 = (block_scale_fp32 * inv_global).to(tl.float8e4nv)
 
     tl.store(
-        block_scale_fp8_ptr
-        + rows * scale_stride_row
-        + pid_g * scale_stride_col,
-        block_scale_fp8, mask=row_mask,
+        block_scale_fp8_ptr + rows * scale_stride_row + pid_g * scale_stride_col,
+        block_scale_fp8,
+        mask=row_mask,
     )
 
     effective = block_scale_fp8.to(tl.float32) * global_scale
@@ -466,11 +509,18 @@ def _quantize_nvfp4_prologue(
 
 @triton.jit
 def _quantize_nvfp4_kernel_native(
-    input_ptr, packed_ptr, block_scale_fp8_ptr, global_scale_ptr,
-    input_stride_row, input_stride_col,
-    packed_stride_row, packed_stride_col,
-    scale_stride_row, scale_stride_col,
-    n_out_rows, n_groups,
+    input_ptr,
+    packed_ptr,
+    block_scale_fp8_ptr,
+    global_scale_ptr,
+    input_stride_row,
+    input_stride_col,
+    packed_stride_row,
+    packed_stride_col,
+    scale_stride_row,
+    scale_stride_col,
+    n_out_rows,
+    n_groups,
     EPS: tl.constexpr,
     BLOCKSIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -479,10 +529,19 @@ def _quantize_nvfp4_kernel_native(
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
     normalized, row_mask = _quantize_nvfp4_prologue(
-        input_ptr, block_scale_fp8_ptr, global_scale_ptr,
-        input_stride_row, input_stride_col,
-        scale_stride_row, scale_stride_col,
-        n_out_rows, EPS, BLOCKSIZE, BLOCK_M, pid_m, pid_g,
+        input_ptr,
+        block_scale_fp8_ptr,
+        global_scale_ptr,
+        input_stride_row,
+        input_stride_col,
+        scale_stride_row,
+        scale_stride_col,
+        n_out_rows,
+        EPS,
+        BLOCKSIZE,
+        BLOCK_M,
+        pid_m,
+        pid_g,
     )
 
     # Even col → low nibble, odd → high (cuBLAS FP4 convention).
@@ -517,11 +576,18 @@ def _quantize_nvfp4_kernel_native(
 
 @triton.jit
 def _quantize_nvfp4_kernel_soft(
-    input_ptr, packed_ptr, block_scale_u8_ptr, global_scale_ptr,
-    input_stride_row, input_stride_col,
-    packed_stride_row, packed_stride_col,
-    scale_stride_row, scale_stride_col,
-    n_out_rows, n_groups,
+    input_ptr,
+    packed_ptr,
+    block_scale_u8_ptr,
+    global_scale_ptr,
+    input_stride_row,
+    input_stride_col,
+    packed_stride_row,
+    packed_stride_col,
+    scale_stride_row,
+    scale_stride_col,
+    n_out_rows,
+    n_groups,
     EPS: tl.constexpr,
     BLOCKSIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -539,17 +605,13 @@ def _quantize_nvfp4_kernel_soft(
     cols = pid_g * BLOCKSIZE + tl.arange(0, BLOCKSIZE)
 
     tile = tl.load(
-        input_ptr
-        + rows[:, None] * input_stride_row
-        + cols[None, :] * input_stride_col,
+        input_ptr + rows[:, None] * input_stride_row + cols[None, :] * input_stride_col,
         mask=row_mask[:, None],
         other=0.0,
     ).to(tl.float32)
 
     scale_u8 = tl.load(
-        block_scale_u8_ptr
-        + rows * scale_stride_row
-        + pid_g * scale_stride_col,
+        block_scale_u8_ptr + rows * scale_stride_row + pid_g * scale_stride_col,
         mask=row_mask,
     )
     scale_fp32 = _fp8_e4m3_bits_to_fp32(scale_u8)
@@ -574,13 +636,14 @@ def _quantize_nvfp4_kernel_soft(
     # IEEE sign bit: bit 31 of the fp32 bit pattern (preserves -0).
     fp32_bits = normalized.to(tl.int32, bitcast=True)
     sign = (fp32_bits >> 31) & 1
-    best_idx = pos | (sign << 3)                             # (BLOCK_M, BLOCKSIZE)
+    best_idx = pos | (sign << 3)  # (BLOCK_M, BLOCKSIZE)
 
     # Pack: even col → low nibble, odd → high.
     idx_pairs = best_idx.reshape(BLOCK_M, BLOCKSIZE // 2, 2)
-    pair_weights = tl.arange(0, 2) * 15 + 1                 # [1, 16]
+    pair_weights = tl.arange(0, 2) * 15 + 1  # [1, 16]
     packed = tl.sum(
-        idx_pairs * pair_weights[None, None, :], axis=2,
+        idx_pairs * pair_weights[None, None, :],
+        axis=2,
     ).to(tl.uint8)
 
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -595,7 +658,8 @@ def _quantize_nvfp4_kernel_soft(
 
 
 def _quantize_nvfp4_triton(
-    tensor: Tensor, eps: float = 1e-12,
+    tensor: Tensor,
+    eps: float = 1e-12,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     assert tensor.ndim == 2
     out_f, in_f = tensor.shape
@@ -608,21 +672,32 @@ def _quantize_nvfp4_triton(
     global_scale = tensor_amax / (FP8_E4M3_MAX * FP4_E2M1_MAX)
 
     packed = torch.empty(
-        (out_f, in_f // 2), dtype=torch.uint8, device=tensor.device,
+        (out_f, in_f // 2),
+        dtype=torch.uint8,
+        device=tensor.device,
     )
     block_scale_fp8 = torch.empty(
-        (out_f, n_groups), dtype=torch.float8_e4m3fn, device=tensor.device,
+        (out_f, n_groups),
+        dtype=torch.float8_e4m3fn,
+        device=tensor.device,
     )
 
     BLOCK_M = 32
     grid = (triton.cdiv(out_f, BLOCK_M), n_groups)
     if _supports_native_fp4():
         _quantize_nvfp4_kernel_native[grid](
-            tensor, packed, block_scale_fp8, global_scale,
-            tensor.stride(0), tensor.stride(1),
-            packed.stride(0), packed.stride(1),
-            block_scale_fp8.stride(0), block_scale_fp8.stride(1),
-            out_f, n_groups,
+            tensor,
+            packed,
+            block_scale_fp8,
+            global_scale,
+            tensor.stride(0),
+            tensor.stride(1),
+            packed.stride(0),
+            packed.stride(1),
+            block_scale_fp8.stride(0),
+            block_scale_fp8.stride(1),
+            out_f,
+            n_groups,
             EPS=eps,
             BLOCKSIZE=NVFP4_BLOCKSIZE,
             BLOCK_M=BLOCK_M,
@@ -638,11 +713,18 @@ def _quantize_nvfp4_triton(
         )
         scale_u8 = block_scale_fp8.view(torch.uint8)
         _quantize_nvfp4_kernel_soft[grid](
-            tensor, packed, scale_u8, global_scale,
-            tensor.stride(0), tensor.stride(1),
-            packed.stride(0), packed.stride(1),
-            scale_u8.stride(0), scale_u8.stride(1),
-            out_f, n_groups,
+            tensor,
+            packed,
+            scale_u8,
+            global_scale,
+            tensor.stride(0),
+            tensor.stride(1),
+            packed.stride(0),
+            packed.stride(1),
+            scale_u8.stride(0),
+            scale_u8.stride(1),
+            out_f,
+            n_groups,
             EPS=eps,
             BLOCKSIZE=NVFP4_BLOCKSIZE,
             BLOCK_M=BLOCK_M,
@@ -654,24 +736,36 @@ def _quantize_nvfp4_triton(
 # Tensor subclass
 # ----------------------------------------------------------------------
 
+
 class NVFP4QWeight(QWeightBase):
     """NVFP4 blockwise QAT weight, compressed-tensors W4A16 format."""
 
     @staticmethod
     @torch._dynamo.disable
     def __new__(
-        cls, weight_packed: Tensor, block_scale_fp8: Tensor,
-        global_scale: Tensor, in_f: int, outer_dtype: torch.dtype,
+        cls,
+        weight_packed: Tensor,
+        block_scale_fp8: Tensor,
+        global_scale: Tensor,
+        in_f: int,
+        outer_dtype: torch.dtype,
     ):
         out_f = weight_packed.shape[0]
         return Tensor._make_wrapper_subclass(
-            cls, (out_f, in_f), dtype=outer_dtype, device=weight_packed.device,
+            cls,
+            (out_f, in_f),
+            dtype=outer_dtype,
+            device=weight_packed.device,
         )
 
     @torch._dynamo.disable
     def __init__(
-        self, weight_packed: Tensor, block_scale_fp8: Tensor,
-        global_scale: Tensor, in_f: int, outer_dtype: torch.dtype,
+        self,
+        weight_packed: Tensor,
+        block_scale_fp8: Tensor,
+        global_scale: Tensor,
+        in_f: int,
+        outer_dtype: torch.dtype,
     ):
         assert weight_packed.dtype is torch.uint8 and weight_packed.ndim == 2
         assert block_scale_fp8.dtype is torch.float8_e4m3fn
@@ -685,14 +779,17 @@ class NVFP4QWeight(QWeightBase):
 
     def __tensor_flatten__(self):
         return ["weight_packed", "block_scale_fp8", "global_scale"], [
-            self.in_f, self.outer_dtype,
+            self.in_f,
+            self.outer_dtype,
         ]
 
     @classmethod
     def __tensor_unflatten__(cls, tensors, attrs, outer_size=None, outer_stride=None):
         return cls(
-            tensors["weight_packed"], tensors["block_scale_fp8"],
-            tensors["global_scale"], *attrs,
+            tensors["weight_packed"],
+            tensors["block_scale_fp8"],
+            tensors["global_scale"],
+            *attrs,
         )
 
     @classmethod
@@ -715,12 +812,18 @@ class NVFP4QWeight(QWeightBase):
             dtype = self.outer_dtype
         if dtype in _TL_DTYPE_MAP:
             return _dequant_nvfp4_triton(
-                self.weight_packed, self.block_scale_fp8, self.global_scale,
-                self.in_f, dtype,
+                self.weight_packed,
+                self.block_scale_fp8,
+                self.global_scale,
+                self.in_f,
+                dtype,
             )
         return dequantize_nvfp4_blockwise(
-            self.weight_packed, self.block_scale_fp8, self.global_scale,
-            self.in_f, dtype,
+            self.weight_packed,
+            self.block_scale_fp8,
+            self.global_scale,
+            self.in_f,
+            dtype,
         )
 
     @classmethod
@@ -751,7 +854,9 @@ class NVFP4QWeight(QWeightBase):
         # Undo the reciprocal applied on save.
         global_scale = (1.0 / plain["weight_global_scale"]).reshape(())
         in_f = weight_packed.shape[1] * 2
-        return cls(weight_packed, block_scale, global_scale, in_f, reference.outer_dtype)
+        return cls(
+            weight_packed, block_scale, global_scale, in_f, reference.outer_dtype
+        )
 
     @classmethod
     def build_hf_quantization_config(cls, skip_patterns=(), **_) -> dict:
@@ -784,6 +889,7 @@ class NVFP4QWeight(QWeightBase):
 # Autograd: F.linear through the dequantize path
 # ----------------------------------------------------------------------
 
+
 class _NVFP4WeightOnlyLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: Tensor, weight: NVFP4QWeight, bias: Optional[Tensor] = None):
@@ -810,6 +916,7 @@ class _NVFP4WeightOnlyLinear(torch.autograd.Function):
 # Dispatch
 # ----------------------------------------------------------------------
 
+
 @NVFP4QWeight.implements_torch_function(torch.nn.functional.linear)
 def _(func, types, args, kwargs):
     return _NVFP4WeightOnlyLinear.apply(*args, **kwargs)
@@ -821,7 +928,8 @@ def _(func, types, args, kwargs):
         func(args[0].weight_packed, *args[1:], **kwargs),
         func(args[0].block_scale_fp8, *args[1:], **kwargs),
         func(args[0].global_scale, *args[1:], **kwargs),
-        args[0].in_f, args[0].outer_dtype,
+        args[0].in_f,
+        args[0].outer_dtype,
     )
     return return_and_correct_aliasing(func, args, kwargs, out)
 
@@ -835,7 +943,8 @@ def _(func, types, args, kwargs):
         args[0].weight_packed.to(device=device),
         args[0].block_scale_fp8.to(device=device),
         args[0].global_scale.to(device=device),
-        args[0].in_f, outer,
+        args[0].in_f,
+        outer,
     )
     return return_and_correct_aliasing(func, args, kwargs, out)
 

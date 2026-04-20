@@ -25,6 +25,7 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 # -------- python quantize -----------------------------------------------
 
+
 def test_quantize_int8_shape_and_dtype():
     torch.manual_seed(0)
     w = torch.randn(64, 256, dtype=torch.float32) * 0.05
@@ -47,7 +48,8 @@ def test_int8_layout_convention():
     """
     # Known row with amax at position 2.
     row = torch.tensor(
-        [[0.0, 0.5, -2.0, 1.0]], dtype=torch.float32,
+        [[0.0, 0.5, -2.0, 1.0]],
+        dtype=torch.float32,
     )
     weight, scales = quantize_int8_per_channel(row)
     assert weight.shape == (1, 4)
@@ -63,15 +65,19 @@ def test_int8_layout_convention():
 
 # -------- dequant triton parity -----------------------------------------
 
+
 @CUDA
-@pytest.mark.parametrize("out_f,in_f", [
-    (128, 256),
-    (4096, 4096),
-    (12288, 4096),
-    (4096, 11008),
-    (35, 256),      # BLOCK_M-misaligned rows
-    (64, 37),       # BLOCK_N-misaligned cols
-])
+@pytest.mark.parametrize(
+    "out_f,in_f",
+    [
+        (128, 256),
+        (4096, 4096),
+        (12288, 4096),
+        (4096, 11008),
+        (35, 256),  # BLOCK_M-misaligned rows
+        (64, 37),  # BLOCK_N-misaligned cols
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dequant_triton_parity(out_f, in_f, dtype):
     torch.manual_seed(0)
@@ -96,14 +102,13 @@ def test_dequantize_fp32_fallback():
     w = torch.randn(64, 256, dtype=torch.bfloat16, device="cuda") * 0.05
     qw = Int8QWeight.from_float(w)
     got = qw.dequantize(torch.float32)
-    expected = (
-        qw.weight.to(torch.float32) * qw.scales.to(torch.float32).unsqueeze(1)
-    )
+    expected = qw.weight.to(torch.float32) * qw.scales.to(torch.float32).unsqueeze(1)
     assert got.dtype == torch.float32
     assert torch.equal(got, expected)
 
 
 # -------- F.linear dispatch ---------------------------------------------
+
 
 @CUDA
 def test_linear_autograd_matches_dequant_reference():
@@ -115,7 +120,11 @@ def test_linear_autograd_matches_dequant_reference():
     qw.requires_grad_(True)
     b.requires_grad_(True)
     x = torch.randn(
-        batch, in_f, dtype=torch.bfloat16, device="cuda", requires_grad=True,
+        batch,
+        in_f,
+        dtype=torch.bfloat16,
+        device="cuda",
+        requires_grad=True,
     )
 
     y = F.linear(x, qw, b)
@@ -136,15 +145,19 @@ def test_linear_autograd_matches_dequant_reference():
 
 # -------- triton quantize parity ----------------------------------------
 
+
 @CUDA
-@pytest.mark.parametrize("out_f,in_f", [
-    (128, 256),
-    (4096, 4096),
-    (12288, 4096),
-    (4096, 11008),
-    (35, 256),
-    (64, 37),
-])
+@pytest.mark.parametrize(
+    "out_f,in_f",
+    [
+        (128, 256),
+        (4096, 4096),
+        (12288, 4096),
+        (4096, 11008),
+        (35, 256),
+        (64, 37),
+    ],
+)
 @pytest.mark.parametrize("src_dtype", [torch.bfloat16, torch.float32])
 def test_quantize_triton_parity(out_f, in_f, src_dtype):
     torch.manual_seed(0)
@@ -178,13 +191,16 @@ def test_copy_fp32_to_int8_matches_fresh_quantize():
     assert torch.equal(qw.weight, ref_weight)
     # Stored scales.dtype = bf16; fresh quantize returns fp32.
     assert torch.allclose(
-        qw.scales.float(), ref_scales.float(), atol=1e-2, rtol=1e-2,
+        qw.scales.float(),
+        ref_scales.float(),
+        atol=1e-2,
+        rtol=1e-2,
     )
 
 
 def test_can_quantize():
     assert Int8QWeight.can_quantize(torch.empty(4, 4))
-    assert Int8QWeight.can_quantize(torch.empty(33, 16))    # in_f % 4 == 0
-    assert not Int8QWeight.can_quantize(torch.empty(4, 17)) # in_f not % 4
+    assert Int8QWeight.can_quantize(torch.empty(33, 16))  # in_f % 4 == 0
+    assert not Int8QWeight.can_quantize(torch.empty(4, 17))  # in_f not % 4
     assert not Int8QWeight.can_quantize(torch.empty(4))
     assert not Int8QWeight.can_quantize(torch.empty(4, 4, 4))

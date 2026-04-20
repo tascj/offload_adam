@@ -110,7 +110,9 @@ class QWeightBase(Tensor):
 
     @classmethod
     def build_hf_quantization_config(
-        cls, skip_patterns=(), **weight_kwargs,
+        cls,
+        skip_patterns=(),
+        **weight_kwargs,
     ) -> dict:
         """HF-style ``quantization_config`` dict for this subclass.
 

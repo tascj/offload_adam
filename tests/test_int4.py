@@ -31,14 +31,13 @@ def _python_dequant(qweight, scales, group_size):
     out_f = qweight.shape[1]
     n_groups = scales.shape[0]
     return (
-        unpack_int4_gptq(qweight)
-        .reshape(out_f, n_groups, group_size)
-        .to(scales.dtype)
+        unpack_int4_gptq(qweight).reshape(out_f, n_groups, group_size).to(scales.dtype)
         * scales.T.unsqueeze(-1)
     ).reshape(out_f, in_f)
 
 
 # -------- pack / unpack convention --------------------------------------
+
 
 def test_pack_unpack_roundtrip_cpu():
     torch.manual_seed(0)
@@ -72,6 +71,7 @@ def test_int4_layout_convention():
 
 # -------- python quantize -----------------------------------------------
 
+
 def test_quantize_int4_groupwise_shape_and_dtype():
     torch.manual_seed(0)
     w = torch.randn(64, 256, dtype=torch.float32) * 0.05
@@ -87,14 +87,18 @@ def test_quantize_int4_groupwise_shape_and_dtype():
 
 # -------- dequant triton parity -----------------------------------------
 
+
 @CUDA
-@pytest.mark.parametrize("out_f,in_f,group_size", [
-    (128, 256, 128),
-    (4096, 4096, 128),
-    (12288, 4096, 128),
-    (4096, 11008, 128),
-    (35, 256, 128),     # BLOCK_M-misaligned rows
-])
+@pytest.mark.parametrize(
+    "out_f,in_f,group_size",
+    [
+        (128, 256, 128),
+        (4096, 4096, 128),
+        (12288, 4096, 128),
+        (4096, 11008, 128),
+        (35, 256, 128),  # BLOCK_M-misaligned rows
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dequant_triton_parity(out_f, in_f, group_size, dtype):
     torch.manual_seed(0)
@@ -108,7 +112,7 @@ def test_dequant_triton_parity(out_f, in_f, group_size, dtype):
     assert got.dtype == ref.dtype
     assert torch.equal(got, ref), (
         f"shape=({out_f},{in_f}) g={group_size} dtype={dtype}: "
-        f"max_abs={(got.float()-ref.float()).abs().max().item()}"
+        f"max_abs={(got.float() - ref.float()).abs().max().item()}"
     )
 
 
@@ -120,9 +124,7 @@ def test_dequantize_fp32_fallback():
     qw = Int4QWeight.from_float(w, group_size=128)
     got = qw.dequantize(torch.float32)
     expected = (
-        unpack_int4_gptq(qw.qweight)
-        .reshape(64, 2, 128)
-        .to(torch.float32)
+        unpack_int4_gptq(qw.qweight).reshape(64, 2, 128).to(torch.float32)
         * qw.scales.T.to(torch.float32).unsqueeze(-1)
     ).reshape(64, 256)
     assert got.dtype == torch.float32
@@ -130,6 +132,7 @@ def test_dequantize_fp32_fallback():
 
 
 # -------- F.linear dispatch ---------------------------------------------
+
 
 @CUDA
 def test_linear_autograd_matches_dequant_reference():
@@ -141,7 +144,11 @@ def test_linear_autograd_matches_dequant_reference():
     qw.requires_grad_(True)
     b.requires_grad_(True)
     x = torch.randn(
-        batch, in_f, dtype=torch.bfloat16, device="cuda", requires_grad=True,
+        batch,
+        in_f,
+        dtype=torch.bfloat16,
+        device="cuda",
+        requires_grad=True,
     )
 
     y = F.linear(x, qw, b)
@@ -162,14 +169,18 @@ def test_linear_autograd_matches_dequant_reference():
 
 # -------- triton quantize parity ----------------------------------------
 
+
 @CUDA
-@pytest.mark.parametrize("out_f,in_f,group_size", [
-    (128, 256, 128),
-    (4096, 4096, 128),
-    (12288, 4096, 128),
-    (4096, 11008, 128),
-    (35, 256, 128),
-])
+@pytest.mark.parametrize(
+    "out_f,in_f,group_size",
+    [
+        (128, 256, 128),
+        (4096, 4096, 128),
+        (12288, 4096, 128),
+        (4096, 11008, 128),
+        (35, 256, 128),
+    ],
+)
 @pytest.mark.parametrize("src_dtype", [torch.bfloat16, torch.float32])
 def test_quantize_triton_parity(out_f, in_f, group_size, src_dtype):
     torch.manual_seed(0)
@@ -185,7 +196,7 @@ def test_quantize_triton_parity(out_f, in_f, group_size, src_dtype):
     )
     assert torch.equal(got_scales, ref_scales), (
         f"scales mismatch: max_abs="
-        f"{(got_scales.float()-ref_scales.float()).abs().max()}"
+        f"{(got_scales.float() - ref_scales.float()).abs().max()}"
     )
 
 
@@ -203,5 +214,8 @@ def test_copy_fp32_to_int4_matches_fresh_quantize():
     assert torch.equal(qw.qweight, ref_qweight)
     # Stored scales.dtype = bf16; fresh quantize returns fp32.
     assert torch.allclose(
-        qw.scales.float(), ref_scales.float(), atol=1e-2, rtol=1e-2,
+        qw.scales.float(),
+        ref_scales.float(),
+        atol=1e-2,
+        rtol=1e-2,
     )

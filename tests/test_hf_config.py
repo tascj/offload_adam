@@ -18,15 +18,16 @@ from offload_adam.qweight import (
     save_quantized_pretrained,
 )
 
-
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 # -------- per-dtype config shape ---------------------------------------
 
+
 def test_int4_config_is_gptq():
     cfg = Int4QWeight.build_hf_quantization_config(
-        skip_patterns=("lm_head",), group_size=128,
+        skip_patterns=("lm_head",),
+        group_size=128,
     )
     assert cfg["quant_method"] == "gptq"
     assert cfg["bits"] == 4
@@ -76,6 +77,7 @@ def test_nvfp4_config_is_compressed_tensors():
 
 # -------- update_hf_config flag ----------------------------------------
 
+
 class _ModelWithConfig(nn.Module):
     def __init__(self):
         super().__init__()
@@ -87,7 +89,9 @@ class _ModelWithConfig(nn.Module):
 def test_update_hf_config_sets_attribute():
     m = _ModelWithConfig().to(torch.bfloat16).cuda()
     quantize_linears(
-        m, Int4QWeight, group_size=128,
+        m,
+        Int4QWeight,
+        group_size=128,
         skip_patterns=("lm_head",),
         update_hf_config=True,
     )
@@ -113,6 +117,7 @@ def test_update_hf_config_skipped_when_no_config():
 
 # -------- save_quantized_pretrained ------------------------------------
 
+
 class _FakeHFModel(nn.Module):
     """Mimics just enough of a HF model for save_quantized_pretrained:
     a `save_pretrained(save_dir)` that writes a `config.json`."""
@@ -124,6 +129,7 @@ class _FakeHFModel(nn.Module):
 
     def save_pretrained(self, save_dir):
         from pathlib import Path
+
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         (save_dir / "config.json").write_text(json.dumps(self._base_config))
@@ -131,13 +137,20 @@ class _FakeHFModel(nn.Module):
 
 @CUDA
 def test_save_quantized_pretrained_patches_config(tmp_path):
-    m = _FakeHFModel({"model_type": "tiny", "hidden_size": 128}).to(
-        torch.bfloat16,
-    ).cuda()
+    m = (
+        _FakeHFModel({"model_type": "tiny", "hidden_size": 128})
+        .to(
+            torch.bfloat16,
+        )
+        .cuda()
+    )
     quantize_linears(m, Int4QWeight, group_size=128)
     save_quantized_pretrained(
-        m, tmp_path, Int4QWeight,
-        skip_patterns=("lm_head",), group_size=128,
+        m,
+        tmp_path,
+        Int4QWeight,
+        skip_patterns=("lm_head",),
+        group_size=128,
     )
     saved = json.loads((tmp_path / "config.json").read_text())
     # Original fields preserved.

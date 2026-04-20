@@ -26,6 +26,7 @@ aten = torch.ops.aten
 # Python reference: pack / unpack / quantize
 # ----------------------------------------------------------------------
 
+
 def pack_int4_gptq(int_data: Tensor) -> Tensor:
     """Pack signed int4 into the GPTQ int32 layout.
 
@@ -40,26 +41,28 @@ def pack_int4_gptq(int_data: Tensor) -> Tensor:
         f"in_features={int_data.shape[1]} must be a multiple of 8"
     )
     out_f, in_f = int_data.shape
-    u = (int_data + 8).to(torch.int32)             # uint4 range [0, 15] in int32
+    u = (int_data + 8).to(torch.int32)  # uint4 range [0, 15] in int32
     u = u.reshape(out_f, in_f // 8, 8)
     shifts = (torch.arange(8, device=u.device) * 4).to(torch.int32)
-    packed = (u << shifts).sum(dim=-1, dtype=torch.int32)   # (out_f, in_f//8)
-    return packed.T.contiguous()                   # (in_f//8, out_f)
+    packed = (u << shifts).sum(dim=-1, dtype=torch.int32)  # (out_f, in_f//8)
+    return packed.T.contiguous()  # (in_f//8, out_f)
 
 
 def unpack_int4_gptq(packed: Tensor) -> Tensor:
     """Inverse of `pack_int4_gptq`. Returns (out_f, in_f) int8 in [-8, 7]."""
     in_f_div_8, out_f = packed.shape
     in_f = in_f_div_8 * 8
-    p = packed.T.contiguous()                      # (out_f, in_f//8) int32
+    p = packed.T.contiguous()  # (out_f, in_f//8) int32
     shifts = (torch.arange(8, device=p.device) * 4).to(torch.int32)
-    u = (p.unsqueeze(-1) >> shifts) & 0xF          # (out_f, in_f//8, 8) int32
+    u = (p.unsqueeze(-1) >> shifts) & 0xF  # (out_f, in_f//8, 8) int32
     return (u - 8).to(torch.int8).reshape(out_f, in_f)
 
 
 @torch.no_grad()
 def quantize_int4_groupwise(
-    tensor: Tensor, group_size: int = 128, eps: float = 1e-12,
+    tensor: Tensor,
+    group_size: int = 128,
+    eps: float = 1e-12,
 ) -> Tuple[Tensor, Tensor]:
     """Reference python quantize → GPTQ layout.
 
@@ -79,13 +82,13 @@ def quantize_int4_groupwise(
     orig_dtype = tensor.dtype
 
     t = tensor.float().reshape(out_f, n_groups, group_size)
-    scale = t.abs().amax(dim=-1) / 8                   # (out_f, n_groups) fp32
+    scale = t.abs().amax(dim=-1) / 8  # (out_f, n_groups) fp32
     inv_scale = 1.0 / scale.clamp(min=eps)
     q = (t * inv_scale.unsqueeze(-1)).round().clamp(-8, 7).to(torch.int8)
-    q = q.reshape(out_f, in_f)                         # (out_f, in_f) int8
+    q = q.reshape(out_f, in_f)  # (out_f, in_f) int8
 
-    qweight = pack_int4_gptq(q)                        # (in_f//8, out_f) int32
-    scales = scale.T.contiguous().to(orig_dtype)       # (n_groups, out_f)
+    qweight = pack_int4_gptq(q)  # (in_f//8, out_f) int32
+    scales = scale.T.contiguous().to(orig_dtype)  # (n_groups, out_f)
     return qweight, scales
 
 
@@ -93,19 +96,24 @@ def quantize_int4_groupwise(
 # Triton kernels
 # ----------------------------------------------------------------------
 
+
 @triton.jit
 def _dequant_int4_kernel(
-    qweight_ptr,     # (in_f // 8, out_f) int32
-    scales_ptr,      # (n_groups, out_f) scales.dtype
-    out_ptr,         # (out_f, in_f) out.dtype
-    qweight_stride_k, qweight_stride_n,
-    scales_stride_g, scales_stride_n,
-    out_stride_row, out_stride_col,
+    qweight_ptr,  # (in_f // 8, out_f) int32
+    scales_ptr,  # (n_groups, out_f) scales.dtype
+    out_ptr,  # (out_f, in_f) out.dtype
+    qweight_stride_k,
+    qweight_stride_n,
+    scales_stride_g,
+    scales_stride_n,
+    out_stride_row,
+    out_stride_col,
     n_out_rows,
     GROUP_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
-    """Fused unpack + scale + dtype cast, one (BLOCK_M rows, 1 group) tile per program."""
+    """Fused unpack + scale + dtype cast, one (BLOCK_M rows, 1 group) tile
+    per program."""
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
 
@@ -121,16 +129,16 @@ def _dequant_int4_kernel(
         + rows[None, :] * qweight_stride_n,
         mask=row_mask[None, :],
         other=0,
-    )                                                     # (K_PACKED, BLOCK_M) int32
+    )  # (K_PACKED, BLOCK_M) int32
 
     scale = tl.load(
         scales_ptr + pid_g * scales_stride_g + rows * scales_stride_n,
         mask=row_mask,
-    )                                                     # (BLOCK_M,)
+    )  # (BLOCK_M,)
 
-    shifts = tl.arange(0, 8) * 4                          # (8,) int32
+    shifts = tl.arange(0, 8) * 4  # (8,) int32
     unpacked = (q_tile[:, :, None] >> shifts[None, None, :]) & 0xF
-    signed = unpacked.to(tl.int8) - 8                     # (K_PACKED, BLOCK_M, 8)
+    signed = unpacked.to(tl.int8) - 8  # (K_PACKED, BLOCK_M, 8)
     scaled = signed.to(scale.dtype) * scale[None, :, None]
 
     # (K_PACKED, BLOCK_M, 8) → (BLOCK_M, K_PACKED, 8) → (BLOCK_M, GROUP_SIZE)
@@ -145,7 +153,9 @@ def _dequant_int4_kernel(
 
 
 def _dequant_int4_triton(
-    qweight: Tensor, scales: Tensor, group_size: int,
+    qweight: Tensor,
+    scales: Tensor,
+    group_size: int,
 ) -> Tensor:
     """Dequantize (in_f//8, out_f) int32 qweight + (n_groups, out_f) scales
     into (out_f, in_f) at scales.dtype."""
@@ -157,10 +167,15 @@ def _dequant_int4_triton(
     BLOCK_M = 32
     grid = (triton.cdiv(out_f, BLOCK_M), n_groups)
     _dequant_int4_kernel[grid](
-        qweight, scales, out,
-        qweight.stride(0), qweight.stride(1),
-        scales.stride(0), scales.stride(1),
-        out.stride(0), out.stride(1),
+        qweight,
+        scales,
+        out,
+        qweight.stride(0),
+        qweight.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        out.stride(0),
+        out.stride(1),
         out_f,
         GROUP_SIZE=group_size,
         BLOCK_M=BLOCK_M,
@@ -170,18 +185,22 @@ def _dequant_int4_triton(
 
 @triton.jit
 def _quantize_pack_int4_kernel(
-    input_ptr,       # (out_f, in_f) bf16 / fp16 / fp32
-    qweight_ptr,     # (in_f // 8, out_f) int32
-    scales_ptr,      # (n_groups, out_f) scales.dtype
-    input_stride_row, input_stride_col,
-    qweight_stride_k, qweight_stride_n,
-    scales_stride_g, scales_stride_n,
+    input_ptr,  # (out_f, in_f) bf16 / fp16 / fp32
+    qweight_ptr,  # (in_f // 8, out_f) int32
+    scales_ptr,  # (n_groups, out_f) scales.dtype
+    input_stride_row,
+    input_stride_col,
+    qweight_stride_k,
+    qweight_stride_n,
+    scales_stride_g,
+    scales_stride_n,
     n_out_rows,
     EPS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
-    """Fused per-group absmax / int4 round / 8-into-int32 pack, one (BLOCK_M, 1 group) tile per program."""
+    """Fused per-group absmax / int4 round / 8-into-int32 pack, one
+    (BLOCK_M, 1 group) tile per program."""
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
 
@@ -191,9 +210,7 @@ def _quantize_pack_int4_kernel(
     cols = pid_g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
 
     tile = tl.load(
-        input_ptr
-        + rows[:, None] * input_stride_row
-        + cols[None, :] * input_stride_col,
+        input_ptr + rows[:, None] * input_stride_row + cols[None, :] * input_stride_col,
         mask=row_mask[:, None],
         other=0.0,
     ).to(tl.float32)
@@ -204,18 +221,19 @@ def _quantize_pack_int4_kernel(
     inv_scale = tl.extra.libdevice.rcp_rn(tl.maximum(scale, EPS))
 
     scaled = tile * inv_scale[:, None]
-    q_f = tl.extra.libdevice.rint(scaled)               # round-half-to-even
+    q_f = tl.extra.libdevice.rint(scaled)  # round-half-to-even
     q_f = tl.maximum(q_f, -8.0)
     q_f = tl.minimum(q_f, 7.0)
-    q_int = q_f.to(tl.int32)                            # keep in int32 for shifts
+    q_int = q_f.to(tl.int32)  # keep in int32 for shifts
 
-    u = q_int + 8                                       # uint4 [0, 15] in int32
+    u = q_int + 8  # uint4 [0, 15] in int32
     u = u.reshape(BLOCK_M, GROUP_SIZE // 8, 8)
 
-    shifts = tl.arange(0, 8) * 4                        # (8,) int32
+    shifts = tl.arange(0, 8) * 4  # (8,) int32
     packed_per_row = tl.sum(
-        u * (1 << shifts)[None, None, :], axis=2,
-    )                                                   # (BLOCK_M, K_PACKED) int32
+        u * (1 << shifts)[None, None, :],
+        axis=2,
+    )  # (BLOCK_M, K_PACKED) int32
 
     # (BLOCK_M, K_PACKED) → (K_PACKED, BLOCK_M) for m-inner store.
     packed_kn = tl.trans(packed_per_row, 1, 0)
@@ -238,7 +256,9 @@ def _quantize_pack_int4_kernel(
 
 
 def _quantize_pack_int4_triton(
-    tensor: Tensor, group_size: int, scale_dtype: torch.dtype,
+    tensor: Tensor,
+    group_size: int,
+    scale_dtype: torch.dtype,
 ) -> Tuple[Tensor, Tensor]:
     """Fused triton quantize + GPTQ pack. Returns (qweight, scales)."""
     assert tensor.ndim == 2
@@ -247,18 +267,27 @@ def _quantize_pack_int4_triton(
     assert in_f % 8 == 0
     n_groups = in_f // group_size
     qweight = torch.empty(
-        (in_f // 8, out_f), dtype=torch.int32, device=tensor.device,
+        (in_f // 8, out_f),
+        dtype=torch.int32,
+        device=tensor.device,
     )
     scales = torch.empty(
-        (n_groups, out_f), dtype=scale_dtype, device=tensor.device,
+        (n_groups, out_f),
+        dtype=scale_dtype,
+        device=tensor.device,
     )
     BLOCK_M = 32
     grid = (triton.cdiv(out_f, BLOCK_M), n_groups)
     _quantize_pack_int4_kernel[grid](
-        tensor, qweight, scales,
-        tensor.stride(0), tensor.stride(1),
-        qweight.stride(0), qweight.stride(1),
-        scales.stride(0), scales.stride(1),
+        tensor,
+        qweight,
+        scales,
+        tensor.stride(0),
+        tensor.stride(1),
+        qweight.stride(0),
+        qweight.stride(1),
+        scales.stride(0),
+        scales.stride(1),
         out_f,
         EPS=1e-12,
         GROUP_SIZE=group_size,
@@ -271,6 +300,7 @@ def _quantize_pack_int4_triton(
 # Tensor subclass
 # ----------------------------------------------------------------------
 
+
 class Int4QWeight(QWeightBase):
     """Int4 groupwise symmetric QAT weight, raw GPTQ storage."""
 
@@ -280,7 +310,10 @@ class Int4QWeight(QWeightBase):
         in_f = qweight.shape[0] * 8
         out_f = qweight.shape[1]
         return Tensor._make_wrapper_subclass(
-            cls, (out_f, in_f), dtype=scales.dtype, device=qweight.device,
+            cls,
+            (out_f, in_f),
+            dtype=scales.dtype,
+            device=qweight.device,
         )
 
     @torch._dynamo.disable
@@ -300,7 +333,9 @@ class Int4QWeight(QWeightBase):
 
     @classmethod
     def from_float(
-        cls, tensor: Tensor, group_size: int = 128,
+        cls,
+        tensor: Tensor,
+        group_size: int = 128,
         scale_dtype: torch.dtype = torch.bfloat16,
     ):
         """Quantize ``tensor`` into an ``Int4QWeight``.
@@ -326,17 +361,23 @@ class Int4QWeight(QWeightBase):
     def dequantize(self, dtype=None) -> Tensor:
         if dtype is None or dtype == self.scales.dtype:
             return _dequant_int4_triton(
-                self.qweight, self.scales, self.group_size,
+                self.qweight,
+                self.scales,
+                self.group_size,
             )
         # fp32 upcast or cross-dtype request: python fallback.
         n_groups = self.scales.shape[0]
         compute_dtype = torch.float32 if dtype == torch.float32 else self.scales.dtype
         return (
-            unpack_int4_gptq(self.qweight)
-            .reshape(self.shape[0], n_groups, self.group_size)
-            .to(compute_dtype)
-            * self.scales.T.to(compute_dtype).unsqueeze(-1)
-        ).reshape(self.shape).to(dtype)
+            (
+                unpack_int4_gptq(self.qweight)
+                .reshape(self.shape[0], n_groups, self.group_size)
+                .to(compute_dtype)
+                * self.scales.T.to(compute_dtype).unsqueeze(-1)
+            )
+            .reshape(self.shape)
+            .to(dtype)
+        )
 
     @classmethod
     def canonical_key_suffixes(cls) -> Tuple[str, ...]:
@@ -349,7 +390,8 @@ class Int4QWeight(QWeightBase):
             f"out_features={out_f} must be a multiple of 8 to serialize "
             f"symmetric qzeros"
         )
-        # Symmetric zero-point 8 at every slot → 0x88888888 per int32 (signed: -0x77777778).
+        # Symmetric zero-point 8 at every slot → 0x88888888 per int32
+        # (signed: -0x77777778).
         qzeros = torch.full(
             (n_groups, out_f // 8),
             fill_value=-0x77777778,
@@ -373,7 +415,10 @@ class Int4QWeight(QWeightBase):
 
     @classmethod
     def build_hf_quantization_config(
-        cls, skip_patterns=(), group_size: int = 128, **_,
+        cls,
+        skip_patterns=(),
+        group_size: int = 128,
+        **_,
     ) -> dict:
         return {
             "quant_method": "gptq",
@@ -395,6 +440,7 @@ class Int4QWeight(QWeightBase):
 # ----------------------------------------------------------------------
 # Autograd: F.linear through the dequantize path
 # ----------------------------------------------------------------------
+
 
 class _Int4WeightOnlyLinear(torch.autograd.Function):
     @staticmethod
@@ -421,6 +467,7 @@ class _Int4WeightOnlyLinear(torch.autograd.Function):
 # ----------------------------------------------------------------------
 # Dispatch
 # ----------------------------------------------------------------------
+
 
 @Int4QWeight.implements_torch_function(torch.nn.functional.linear)
 def _(func, types, args, kwargs):
@@ -457,7 +504,9 @@ def _(func, types, args, kwargs):
         dst.scales.copy_(src.scales)
     elif isinstance(dst, Int4QWeight):
         qweight, scales = _quantize_pack_int4_triton(
-            src, dst.group_size, dst.scales.dtype,
+            src,
+            dst.group_size,
+            dst.scales.dtype,
         )
         dst.qweight.copy_(qweight)
         dst.scales.copy_(scales)
