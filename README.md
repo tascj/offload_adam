@@ -9,7 +9,7 @@ models on a single GPU.
 ## Install
 
 ```bash
-uv sync
+pip install git+https://github.com/tascj/offload_adam.git
 ```
 
 ## Usage
@@ -35,12 +35,12 @@ for step_batches in dataloader:    # outer iter = one optimizer step
         loss = model(**batch).loss / len(step_batches)
         loss.backward()
     optimizer.step()               # no-op without clipping (step ran in
-                                    # the backward hook); runs the chunked
+                                    # the backward hook); runs a one-shot
                                     # step when max_grad_norm is set
 ```
 
-`offload_adam.Adam` is the same Adam kernel without offloading, useful as a
-baseline for bf16 params (which `torch.optim.AdamW` does not handle).
+`offload_adam.Adam` is the Adam without offloading, useful as a
+baseline for bf16 params (`torch.optim.AdamW` does not handle `model.bfloat16().parameters()` properly).
 
 ### Modes
 
@@ -71,6 +71,8 @@ baseline for bf16 params (which `torch.optim.AdamW` does not handle).
 - [`examples/qat`](examples/qat) — quantization-aware training with
   int4 / int8 / NF4 / NVFP4 weight-only quantization on top of
   `OffloadAdam`.
+- [`examples/multi_gpu`](examples/multi_gpu) — multi-GPU training with
+  `DistributedOffloadAdam` via `torchrun`.
 
 ## How it works
 
@@ -83,9 +85,8 @@ is set:
   `optimizer.step()` is a no-op.
 - **`max_grad_norm=<float>`**: backward only accumulates gradients and
   records per-param L2 norms. `optimizer.step()` reduces the global norm,
-  applies the clip coefficient, and walks each param in fixed-size chunks
-  (`step_chunk_size`) of load → compute → writeback. Chunking keeps peak
-  GPU memory bounded for very large params (e.g. embedding tables).
+  applies the clip coefficient, and walks each param with a one-shot
+  load → compute → writeback.
 
 Both paths share the same host↔device transfer primitives. The optimizer
 step itself always runs on GPU.
